@@ -2,9 +2,9 @@
 //! `cargo run --release --bin bundle`), else a `data` folder. Paths are relative to data/, e.g. "maps/avg_berlin.js".
 //!
 //! Pack layout, after the executable's own bytes: each entry compressed, then a JSON index
-//! [[path, offset, length, codec], ...] (offsets from the start of the file; codec 0 deflate, 1 xz), then the footer:
+//! [[path, offset, length, codec], ...] (offsets from the start of the file; codec 1 = xz), then the footer:
 //! u64 index offset, u64 index length (little endian), b"WTVPACK2".
-//! The lite build stores big payloads as their own entries; the data files then point at them with "@<path>".
+//! Big payloads are their own entries; the data files point at them with "@<path>" (see src/bin/bundle.rs).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -14,15 +14,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 const MAGIC: &[u8; 8] = b"WTVPACK2";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Deflate is only written by src/bin/bundle.rs
-pub enum Codec {
-    /// fast to pack (the full build)
-    Deflate = 0,
-    /// smaller, slower to pack (the lite build)
-    Xz = 1,
-}
 
 pub enum Store {
     Dir(PathBuf),
@@ -56,11 +47,8 @@ impl Store {
                 let mut z = vec![0u8; len as usize];
                 f.read_exact(&mut z)?;
                 let mut out = vec![];
-                match codec {
-                    0 => flate2::read::DeflateDecoder::new(&z[..]).read_to_end(&mut out)?,
-                    1 => liblzma::read::XzDecoder::new(&z[..]).read_to_end(&mut out)?,
-                    c => anyhow::bail!("{rel}: unknown codec {c}"),
-                };
+                ensure!(codec == 1, "{rel}: unknown codec {codec}");
+                liblzma::read::XzDecoder::new(&z[..]).read_to_end(&mut out)?;
                 Ok(out)
             }
         }
@@ -102,9 +90,9 @@ fn read_index(path: &Path) -> Result<Option<HashMap<String, (u64, u64, u8)>>> {
 }
 
 /// Write `out` = `exe` + the entries `make` gives for each job (in parallel, a batch at a time to bound memory),
-/// compressed with `codec`, + index + footer. Returns (entries, bytes).
+/// packed with xz, + index + footer. Returns (entries, bytes).
 #[allow(dead_code)] // used by src/bin/bundle.rs
-pub fn bundle<M>(exe: &Path, out: &Path, jobs: &[String], make: M, codec: Codec, progress: impl Fn(usize, usize)) -> Result<(usize, u64)>
+pub fn bundle<M>(exe: &Path, out: &Path, jobs: &[String], make: M, progress: impl Fn(usize, usize)) -> Result<(usize, u64)>
 where
     M: Fn(&str) -> Result<Vec<(String, Vec<u8>)>> + Sync,
 {
@@ -117,7 +105,7 @@ where
     let mut w = std::io::BufWriter::new(File::create(&tmp)?);
     let mut pos = std::io::copy(&mut File::open(exe)?, &mut w)?;
     let mut index = vec![];
-    let batch_len = if codec == Codec::Xz { 8 } else { 16 }; // xz: 8 jobs at a time stay near 5.5 GB
+    let batch_len = 8; // 8 xz encoders at a time stay near 5.5 GB
     for (bi, batch) in jobs.chunks(batch_len).enumerate() {
         let packed: Vec<Result<Vec<(String, Vec<u8>)>>> = batch
             .par_iter()
@@ -125,19 +113,9 @@ where
                 make(job)?
                     .into_iter() // one encoder per job: xz at level 9 holds ~670 MB
                     .map(|(path, raw)| {
-                        let z = match codec {
-                            Codec::Deflate => {
-                                let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-                                e.write_all(&raw)?;
-                                e.finish()?
-                            }
-                            Codec::Xz => {
-                                let mut e = liblzma::write::XzEncoder::new(Vec::new(), 9);
-                                e.write_all(&raw)?;
-                                e.finish()?
-                            }
-                        };
-                        Ok((path, z))
+                        let mut e = liblzma::write::XzEncoder::new(Vec::new(), 9);
+                        e.write_all(&raw)?;
+                        Ok((path, e.finish()?))
                     })
                     .collect()
             })
@@ -145,7 +123,7 @@ where
         for entries in packed {
             for (path, z) in entries? {
                 w.write_all(&z)?;
-                index.push((path, pos, z.len() as u64, codec as u8));
+                index.push((path, pos, z.len() as u64, 1u8));
                 pos += z.len() as u64;
             }
         }
@@ -162,7 +140,7 @@ where
     Ok((index.len(), std::fs::metadata(out)?.len()))
 }
 
-// ------------------------------------------------------------------ lite bundle payloads
+// ------------------------------------------------------------------ bundled payload forms
 
 /// Entry name ending of heightmaps stored as prediction residuals (they pack far smaller than the heights).
 pub const PREDICTED: &str = ".hpred";
@@ -266,15 +244,13 @@ mod tests {
         std::fs::write(dir.join("app.exe"), b"MZ fake program").unwrap();
         let jobs = vec!["index.js".to_string(), "maps/a.js".to_string()];
         let make = |r: &str| Ok(vec![(r.to_string(), r.repeat(500).into_bytes()), (format!("{r}.blob"), vec![7u8; 1000])]);
-        for codec in [Codec::Deflate, Codec::Xz] {
-            let out = dir.join("out/app.exe");
-            let (n, _) = bundle(&dir.join("app.exe"), &out, &jobs, make, codec, |_, _| {}).unwrap();
-            assert_eq!(n, 4);
-            let s = Store::Pack { file: out.clone(), files: read_index(&out).unwrap().unwrap() };
-            assert_eq!(s.read("maps/a.js").unwrap(), "maps/a.js".repeat(500));
-            assert_eq!(s.bytes("index.js.blob").unwrap(), vec![7u8; 1000]);
-            assert!(std::fs::read(&out).unwrap().starts_with(b"MZ fake program"));
-        }
+        let out = dir.join("out/app.exe");
+        let (n, _) = bundle(&dir.join("app.exe"), &out, &jobs, make, |_, _| {}).unwrap();
+        assert_eq!(n, 4);
+        let s = Store::Pack { file: out.clone(), files: read_index(&out).unwrap().unwrap() };
+        assert_eq!(s.read("maps/a.js").unwrap(), "maps/a.js".repeat(500));
+        assert_eq!(s.bytes("index.js.blob").unwrap(), vec![7u8; 1000]);
+        assert!(std::fs::read(&out).unwrap().starts_with(b"MZ fake program"));
         assert!(read_index(&dir.join("app.exe")).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }

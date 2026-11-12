@@ -44,7 +44,7 @@ Keys work after you click the map. The tank follows the slope of the ground, and
 - **Estimated drag:** shells marked *est. drag* have no drag value in the game files, so they use an estimate, and their drop at long range is approximate.
 - **Objects:** buildings, big rocks and walls block shots as solid blocks up to their top, so windows and gaps don't let anything through. Smaller objects (fences, debris) never block.
 - **Trees** are solid crowns that block sight by default but not shots.
-- **Tank models:** the lite build shows a Leopard 2A4 at A for every tank and a T-72A at B. The models are untextured.
+- **Tank models:** a Leopard 2A4 stands at A for every tank and a T-72A at B. The models are untextured.
 - **Driving** has no physics: the tank goes over walls and up any slope, and its gun points along the hull, not at B.
 - **Range marks:** the gunner sight's marks are worked out for level ground. The aim mark for B is always exact.
 - **After a game patch** maps can change, so use the newest release.
@@ -61,7 +61,7 @@ python tank_models.py       # tank models from ../tanks/**/<model>.gltf
 cd ../rust
 cargo run --release                                                  # run the app on ../data
 cargo test --release                                                 # tests
-cargo build --release && cargo run --release --bin bundle -- --lite  # dist/WT-Ballistic-Visualizer-Lite.exe
+cargo build --release && cargo run --release --bin bundle           # dist/WT-Ballistic-Visualizer-Lite.exe
 ```
 
-Objects, trees and ground colours need `extractor/objects` built once (`cargo build --release` there, with wt-unpack's source in `wt-unpack-src/`). Without the `--lite` flag the bundle tool makes the full build, about 1.15 GB, with every tank's own model and full-resolution ground colours.
+Objects, trees and ground colours need `extractor/objects` built once (`cargo build --release` there, with wt-unpack's source in `wt-unpack-src/`).

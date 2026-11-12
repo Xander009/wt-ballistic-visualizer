@@ -155,15 +155,23 @@ pub fn zones(map: &LoadedMap, z: &Zones, border: bool, red: bool) -> ZoneLayer {
             }
         }
     }
-    if red {
+    if red && !z.kill.is_empty() {
+        // one light tint over the union of all red zones (overlaps would stack to near-opaque red and hide the map),
+        // then every zone's own edge: a dark halo under a bright line, readable on any ground
+        let mut union = Pixmap::new(n, n).expect("zone layer size");
         let mut fill = Paint { anti_alias: true, ..Default::default() };
-        fill.set_color_rgba8(140, 0, 0, 140);
-        let mut line = Paint { anti_alias: true, ..Default::default() };
-        line.set_color_rgba8(90, 0, 0, 255);
-        for s in &z.kill {
-            if let Some(p) = path(s) {
-                pm.fill_path(&p, &fill, FillRule::Winding, Transform::identity(), None);
-                pm.stroke_path(&p, &line, &Stroke { width: 2.0, ..Default::default() }, Transform::identity(), None);
+        fill.set_color_rgba8(170, 10, 10, 255);
+        let paths: Vec<_> = z.kill.iter().filter_map(path).collect();
+        for p in &paths {
+            union.fill_path(p, &fill, FillRule::Winding, Transform::identity(), None);
+        }
+        pm.draw_pixmap(0, 0, union.as_ref(), &tiny_skia::PixmapPaint { opacity: 0.3, ..Default::default() }, Transform::identity(), None);
+        let w = (3.0 * n as f32 / 2048.0).max(2.0);
+        for (rgba, width) in [([40, 0, 0, 190], w + 2.5), ([255, 70, 60, 255], w)] {
+            let mut line = Paint { anti_alias: true, ..Default::default() };
+            line.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+            for p in &paths {
+                pm.stroke_path(p, &line, &Stroke { width, ..Default::default() }, Transform::identity(), None);
             }
         }
     }

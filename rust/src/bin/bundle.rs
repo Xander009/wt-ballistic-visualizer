@@ -1,7 +1,6 @@
 //! Make the self-contained build: the app with the data appended (see src/store.rs).
-//!   cargo build --release && cargo run --release --bin bundle [-- [--lite] [<data dir> [<out.exe>]]]
-//! Full: every file of ../data, deflate, into ../dist/WT-Ballistic-Visualizer.exe.
-//! Lite (--lite), into ../dist/WT-Ballistic-Visualizer-Lite.exe, same functions, smaller:
+//!   cargo build --release && cargo run --release --bin bundle [-- [<data dir> [<out.exe>]]]
+//! Writes ../dist/WT-Ballistic-Visualizer-Lite.exe. To keep it small:
 //! - tank models: only a Leopard 2A4 (shown at A for every tank) and the T-72A at B
 //! - heightmaps, objects and tank models stored raw and packed with xz; heightmaps as residuals of a gradient
 //!   predictor (lossless), object mesh positions as 16-bit values over each model's bounding box (~3 mm on 200 m)
@@ -24,29 +23,18 @@ const LITE_GROUND_PX: u32 = 2048;
 
 fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let lite = args.first().is_some_and(|a| a == "--lite");
-    if lite {
-        args.remove(0);
-    }
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--lite").collect(); // --lite: the old flag
     let data = args.first().map(PathBuf::from).unwrap_or_else(|| root.join("../data"));
-    let name = if lite { "WT-Ballistic-Visualizer-Lite.exe" } else { "WT-Ballistic-Visualizer.exe" };
-    let out = args.get(1).map(PathBuf::from).unwrap_or_else(|| root.join("../dist").join(name));
+    let out = args.get(1).map(PathBuf::from).unwrap_or_else(|| root.join("../dist/WT-Ballistic-Visualizer-Lite.exe"));
     let exe = std::env::current_exe()?.with_file_name("wtv.exe");
     anyhow::ensure!(exe.exists(), "{} not found: run `cargo build --release` first", exe.display());
     anyhow::ensure!(data.join("index.js").exists(), "{} has no index.js: run the extractor first", data.display());
 
     let mut jobs = list(&data)?;
-    if lite {
-        jobs.retain(|r| r.strip_prefix("tanks/").is_none_or(|m| m == format!("{LITE_A}.js") || m == format!("{LITE_B}.js")));
-    }
+    jobs.retain(|r| r.strip_prefix("tanks/").is_none_or(|m| m == format!("{LITE_A}.js") || m == format!("{LITE_B}.js")));
     let t0 = std::time::Instant::now();
     let progress = |done: usize, all: usize| eprint!("\rpacking {done}/{all} files");
-    let (n, size) = if lite {
-        store::bundle(&exe, &out, &jobs, |r| lite_entries(&data, r), store::Codec::Xz, progress)?
-    } else {
-        store::bundle(&exe, &out, &jobs, |r| Ok(vec![(r.to_string(), std::fs::read(data.join(r))?)]), store::Codec::Deflate, progress)?
-    };
+    let (n, size) = store::bundle(&exe, &out, &jobs, |r| lite_entries(&data, r), progress)?;
     eprintln!("\nwrote {} ({n} entries, {:.0} MB) in {:.0} s", out.display(), size as f64 / 1e6, t0.elapsed().as_secs_f64());
     Ok(())
 }
