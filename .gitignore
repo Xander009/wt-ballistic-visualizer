@@ -1,0 +1,17 @@
+# Extracted game data, models and builds: shared as release files, never in the repository
+/data/
+/tanks/
+/out/
+/dist/
+target/
+__pycache__/
+rust/shots/
+*.partial
+
+# Third-party tools (download them as the README says)
+/wt-unpack-src/
+/wt-unpack-*/
+/wt_ext_cli-*/
+
+# Local notes
+/WT_BALLISTIC_VISUALIZER.md

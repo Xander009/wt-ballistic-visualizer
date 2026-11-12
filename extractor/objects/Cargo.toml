@@ -1,0 +1,15 @@
+[package]
+name = "wtv-objects"
+version = "0.1.0"
+edition = "2021"
+description = "Placed objects (buildings) of War Thunder levels for the WT ballistic visualizer"
+publish = false
+
+[dependencies]
+anyhow = "1"
+# wt-unpack's library, cloned next to this project (git clone https://github.com/patodois/wt-unpack wt-unpack-src)
+wt-unpack = { path = "../../wt-unpack-src" }
+wt-formats = "0.1.0"
+
+[profile.release]
+opt-level = 3
