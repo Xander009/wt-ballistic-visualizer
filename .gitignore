@@ -15,3 +15,7 @@ rust/shots/
 
 # Local notes
 /WT_BALLISTIC_VISUALIZER.md
+
+# Web version (kept locally, not published)
+/index.html
+/tests/

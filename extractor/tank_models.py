@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the extracted tank glTF models (../tanks/<folder>/<model>.gltf + .bin) into small files for ../index.html.
+"""Convert the extracted tank glTF models (../tanks/<folder>/<model>.gltf + .bin) into small files for the app.
 
 Writes ../data/tanks/<model>.js for every model used by a tank in ../data/index.js, plus t_72a (target B).
 Each model is merged into one mesh, simplified by vertex clustering to at most --tris triangles and stored as

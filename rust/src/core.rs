@@ -1,5 +1,5 @@
-//! Ballistics and terrain core: a line-by-line port of the `<script id="core">` block of ../index.html.
-//! Keep both in step; tests at the bottom repeat tests/core.test.mjs.
+//! Ballistics and terrain core: point-mass flight, the elevation solver, the heightmap surface and the
+//! reach / hit / visibility sweeps. Tests at the bottom.
 
 pub const G: f64 = 9.81;
 pub const DEG: f64 = std::f64::consts::PI / 180.0;
@@ -488,7 +488,7 @@ pub fn path_blocked(t: &Terrain, a: Pt, dir: (f64, f64), tr: &Traj, d: f64, step
 
 #[cfg(test)]
 mod tests {
-    //! Same cases as tests/core.test.mjs.
+    //! Ballistics, solver, terrain, sight line and the three sweeps on small synthetic maps.
     use super::*;
 
     fn shell(v0: f64, m: f64, cal: f64, cx: f64) -> Shell {

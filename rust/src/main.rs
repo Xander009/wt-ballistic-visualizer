@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window in release builds
-//! WT Ballistic Visualizer, native: a port of ../index.html on GPUI (UI) and wgpu (3D views).
+//! WT Ballistic Visualizer: GPUI (UI) and wgpu (3D views).
 //! Reads the same ../data files, or the data bundled into the executable (src/bin/bundle.rs).
 //! Run: cargo run --release
 

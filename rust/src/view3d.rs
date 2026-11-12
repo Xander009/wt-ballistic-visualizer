@@ -1,5 +1,5 @@
 //! 3D orbit and aim views. GPUI has no custom shaders, so the scene is drawn off screen with wgpu
-//! (shaders in view3d.wgsl, ported from index.html), read back and shown as an image; labels and arcs are
+//! (shaders in view3d.wgsl), read back and shown as an image; labels and arcs are
 //! painted over it with GPUI like the page's 2D overlay canvas.
 
 use std::collections::HashMap;

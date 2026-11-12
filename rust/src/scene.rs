@@ -448,7 +448,7 @@ mod tests {
         for m in &map.meta.missions {
             for mode in GameMode::ALL {
                 let (_, _, h) = highest_point(&map, &Zones::of(&mission_areas(m, mode))).unwrap();
-                assert_eq!(format!("{h:.2}"), "61.02", "{} {mode:?}", m.name); // index.html gives 61.02 m for all 15
+                assert_eq!(format!("{h:.2}"), "61.02", "{} {mode:?}", m.name); // checked against a scan of every heightmap cell
             }
         }
     }

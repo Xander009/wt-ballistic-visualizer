@@ -1,5 +1,5 @@
 //! The window: sidebar (map, layers, gun, aim, sweeps, controls), the map (2D or 3D) and the side profile.
-//! Mirrors index.html; state changes end in `changed()`, which recomputes what depends on them.
+//! State changes recompute what depends on them (aim, zones, 3D frame) and notify the view.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,7 +74,7 @@ pub enum ViewMode {
     Sight,
 }
 
-/// Layer and option switches (ids as in index.html).
+/// Layer and option switches.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sw {
     Border,

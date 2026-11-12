@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract War Thunder ground maps, mission areas and tank shell ballistics for ../index.html.
+"""Extract War Thunder ground maps, mission areas and tank shell ballistics into ../data for the app.
 
 Reads the installed game with wt-unpack.exe (vromfs, BLK -> JSON, HM2 heightmap -> 16-bit PNG).
 Writes ../data/index.js and ../data/maps/<level>.js (loaded by <script> tags, so file:// works offline).
