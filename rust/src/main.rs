@@ -18,7 +18,7 @@ use gpui_component::{Root, theme::{Theme, ThemeMode}};
 use gpui_platform::application;
 
 fn main() {
-    application().run(|cx: &mut App| {
+    application().with_assets(gpui_kit_assets::Assets).run(|cx: &mut App| { // icons of the widgets (check marks, dropdown arrows)
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);

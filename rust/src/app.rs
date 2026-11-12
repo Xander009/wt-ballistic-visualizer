@@ -9,6 +9,7 @@ use gpui::*;
 use gpui_component::{
     IndexPath, Sizable,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
     searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectEvent, SelectState},
@@ -161,6 +162,9 @@ pub struct Viewer {
     pub b: Option<Pt>,
     /// A's hull heading once driven (azimuth: 0 = +Z, clockwise to +X); None = facing B
     pub heading: Option<f64>,
+    /// red zones (kill areas, by name) switched off in the list; reset per map
+    hidden_red: std::collections::HashSet<String>,
+    red_open: bool,
     drive_keys: std::collections::HashSet<&'static str>,
     driving: bool,
     pub aim: Option<Aim>,
@@ -225,7 +229,7 @@ impl Viewer {
             pmin, pmax, range, gun_h, tgt_h, sw,
             map: None, map_gen: 0, map_img: None, water: None, zones_img: None, overlay: None,
             mission: 0, mode: GameMode::Realistic, view_mode: ViewMode::Map2D, detail: 2, perf: Perf::Balanced,
-            tank: tank_i, gun_shell: (0, 0), a: None, b: None, heading: None, drive_keys: Default::default(), driving: false, aim: None, high: None,
+            tank: tank_i, gun_shell: (0, 0), a: None, b: None, heading: None, hidden_red: Default::default(), red_open: false, drive_keys: Default::default(), driving: false, aim: None, high: None,
             view: View2D { cx: 0.0, cz: 0.0, s: 0.25 }, map_bounds: Bounds::default(), drag: None, hud: String::new(),
             status: (String::new(), false), sweeping: None, pending_missions: None, pending_view: None, center_pending: false, tanks: Default::default(), v3: View3D::default(),
         };
@@ -255,8 +259,21 @@ impl Viewer {
         Params { p_min: f(&self.pmin, -10.0), p_max: f(&self.pmax, 20.0), range: f(&self.range, 2500.0).max(100.0), gun_h: f(&self.gun_h, 2.0), tgt_h: f(&self.tgt_h, 1.5) }
     }
 
+    /// The mission's areas for the game mode, without the red zones switched off in the list.
     pub fn areas(&self) -> Vec<data::Area> {
+        let mut a = self.all_areas();
+        a.retain(|a| !(a.kind == "kill" && self.hidden_red.contains(&a.name)));
+        a
+    }
+    fn all_areas(&self) -> Vec<data::Area> {
         self.map.as_ref().and_then(|m| m.meta.missions.get(self.mission)).map(|m| scene::mission_areas(m, self.mode)).unwrap_or_default()
+    }
+    fn set_red(&mut self, names: impl IntoIterator<Item = String>, on: bool, cx: &mut Context<Self>) {
+        for n in names {
+            if on { self.hidden_red.remove(&n); } else { self.hidden_red.insert(n); }
+        }
+        self.v3.dirty();
+        cx.notify();
     }
     fn zones(&self) -> Zones {
         Zones::of(&self.areas())
@@ -268,8 +285,11 @@ impl Viewer {
     fn ts(&self) -> Option<&crate::core::Terrain> {
         self.map.as_ref().map(|m| if self.sw.on(Sw::VegSight) { &m.tv } else { &m.tr })
     }
+    /// Map, mission, mode and the red zones switched off: what the zones and the highest point depend on.
     fn high_key(&self) -> String {
-        format!("{}|{}|{:?}", self.map.as_ref().map_or("", |m| m.meta.name.as_str()), self.mission, self.mode)
+        let mut off: Vec<&str> = self.hidden_red.iter().map(String::as_str).collect();
+        off.sort();
+        format!("{}|{}|{:?}|{}", self.map.as_ref().map_or("", |m| m.meta.name.as_str()), self.mission, self.mode, off.join(","))
     }
     pub fn map_bounds(&self) -> Bounds<Pixels> {
         self.map_bounds
@@ -385,6 +405,7 @@ impl Viewer {
         self.aim = None;
         self.overlay = None;
         self.high = None;
+        self.hidden_red.clear();
         self.v3.map_changed();
         self.pending_missions = Some((gen_items, mission)); // applied in render, which has the window
         self.set_status("", false);
@@ -834,6 +855,39 @@ impl Viewer {
         .child(div().flex().flex_col().flex_1().min_w_0().child(div().text_sm().child(title.to_string())).when_some(sub, |d, s| d.child(div().text_xs().text_color(rgb(MUTED)).child(s.to_string()))))
     }
 
+    /// Fold-out list of the red zones of the selected mission and mode, each with its own switch.
+    fn red_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut zones: Vec<(String, Option<i64>)> = vec![];
+        for a in self.all_areas() {
+            if a.kind == "kill" && !zones.iter().any(|z| z.0 == a.name) {
+                zones.push((a.name, a.team));
+            }
+        }
+        let shown = zones.iter().filter(|z| !self.hidden_red.contains(&z.0)).count();
+        let open = self.red_open;
+        let names: Vec<String> = zones.iter().map(|z| z.0.clone()).collect();
+        let (on_all, off_all) = (names.clone(), names);
+        div().flex().flex_col().gap_1().pl(px(44.)).when(!zones.is_empty(), |d| {
+            d.child(
+                div().id("red-list").flex().items_center().gap_1().cursor_pointer().text_xs().text_color(rgb(MUTED))
+                    .child(format!("{} Choose red zones ({shown} of {} on)", if open { "▾" } else { "▸" }, zones.len()))
+                    .on_click(cx.listener(|this, _, _, cx| { this.red_open = !this.red_open; cx.notify(); })),
+            )
+            .when(open, |d| {
+                d.child(div().flex().gap_2()
+                    .child(Button::new("red-all").label("All on").xsmall().on_click(cx.listener(move |this, _, _, cx| this.set_red(on_all.clone(), true, cx))))
+                    .child(Button::new("red-none").label("All off").xsmall().on_click(cx.listener(move |this, _, _, cx| this.set_red(off_all.clone(), false, cx)))))
+                .children(zones.into_iter().enumerate().map(|(i, (name, team))| {
+                    let label = name.replace('_', " ");
+                    let who = match team { Some(1) => "team 1", Some(2) => "team 2", _ => "both teams" };
+                    let n = name.clone();
+                    Checkbox::new(("red-zone", i)).checked(!self.hidden_red.contains(&name)).label(format!("{label} · {who}"))
+                        .on_click(cx.listener(move |this, on: &bool, _, cx| this.set_red([n.clone()], *on, cx)))
+                }))
+            })
+        })
+    }
+
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let high_txt = self.high_shown().map(|(x, z, h)| format!("{h:.1} m at X {x:.0}, Z {z:.0}")).unwrap_or_default();
         let aim_lines: Vec<(String, u8)> = match &self.aim {
@@ -853,6 +907,7 @@ impl Viewer {
             .child(card("Layers")
                 .child(self.switch("sw-border", Sw::Border, "Map border", Some("Outside the battle area, inside the map bounds (countdown)"), Some(0xe61414), cx))
                 .child(self.switch("sw-red", Sw::Red, "Red zones", Some("Placed kill areas (countdown inside)"), Some(0x8c0000), cx))
+                .child(self.red_list(cx))
                 .child(self.switch("sw-caps", Sw::Caps, "Capture zones and spawns", None, Some(0xf2d14b), cx))
                 .child(self.switch("sw-water", Sw::Water, "Water", None, Some(0x3c8cc0), cx))
                 .child(self.switch("sw-grid", Sw::Grid, "100 m grid", None, None, cx))
