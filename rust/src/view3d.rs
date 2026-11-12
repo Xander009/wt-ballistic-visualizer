@@ -1034,6 +1034,14 @@ pub fn paint(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut Ap
         paint::text(window, cx, label, point(p.x + px(9.), p.y - px(20.)), color(0xffffff, 1.0), 12.0, true);
     };
     let aim_mode = v.aim_ready();
+    if v.sw.on(Sw::Red) && !aim_mode {
+        for (i, (_, _, (x, z), on)) in v.red_zones().into_iter().enumerate() {
+            if let Some(p) = proj(x, map.stand(x, z) + 3.0, z) {
+                let (fill, ink) = if on { (color(0xb01818, 0.95), color(0xffffff, 1.0)) } else { (color(0x3a3f45, 0.85), color(0xb8c0c8, 1.0)) };
+                paint::badge(window, cx, p, &(i + 1).to_string(), fill, ink);
+            }
+        }
+    }
     if !aim_mode {
         for (pt, label, col) in [(v.a, "A", COL_A), (v.b, "B", COL_BPT)] {
             if let Some(q) = pt {

@@ -82,6 +82,13 @@ pub fn map(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut App)
             }
         }
     }
+    if v.sw.on(Sw::Red) {
+        // the red zones' numbers from "Choose red zones"; zones switched off keep a grey badge to find them again
+        for (i, (_, _, (x, z), on)) in v.red_zones().into_iter().enumerate() {
+            let (fill, ink) = if on { (color(0xb01818, 0.95), color(0xffffff, 1.0)) } else { (color(0x3a3f45, 0.85), color(0xb8c0c8, 1.0)) };
+            paint::badge(window, cx, sp(v, x, z), &(i + 1).to_string(), fill, ink);
+        }
+    }
     for (pt, label, col) in [(v.a, "A", COL_A), (v.b, "B", COL_BPT)] {
         if let Some(q) = pt {
             let c = sp(v, q.x, q.z);

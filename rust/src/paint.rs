@@ -106,6 +106,17 @@ pub fn label_box(window: &mut Window, cx: &mut App, at: Point<Pixels>, s: &str, 
     line.paint(point(at.x + px(13.), at.y - px(20.)), px(14.), TextAlign::Left, None, window, cx).ok();
 }
 
+/// A number in a round badge centred on `c` (red zone labels).
+pub fn badge(window: &mut Window, cx: &mut App, c: Point<Pixels>, s: &str, fill_col: Hsla, text_col: Hsla) {
+    let mut run = window.text_style().to_run(s.len());
+    run.color = text_col;
+    run.font.weight = gpui::FontWeight::BOLD;
+    let line = window.text_system().shape_line(s.to_string().into(), px(11.), &[run], None);
+    let w = f32::from(line.width);
+    dot(window, c, (w / 2.0 + 5.0).max(9.0), Some(fill_col), Some((color(0xffffff, 0.9), 1.5)));
+    line.paint(point(c.x - px(w / 2.0), c.y - px(7.)), px(14.), TextAlign::Left, None, window, cx).ok();
+}
+
 /// RGBA (straight alpha) to the BGRA image GPUI draws.
 pub fn render_image(img: &image::RgbaImage) -> Arc<RenderImage> {
     let mut bgra = img.clone();

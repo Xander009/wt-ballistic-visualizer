@@ -36,7 +36,7 @@ Keys work after you click the map. The tank follows the slope of the ground, and
 - **Hit target B:** everywhere you could shoot B from. Green means the low arc works, orange means only the high arc does, blue means both.
 - **Visibility from A:** what A can see, and what blocks the view.
 - **Layers:** switch the map border, red zones, capture zones, water, grid, objects, trees and tank models on or off. You can also choose whether trees block sight and shots.
-- **Choose red zones** (under the Red zones switch) lists every red zone of the selected mission, with the team it applies to. Turn single zones off, or all of them with **All off**. A zone that's off is hidden and no longer counts for **Find highest point** and **Hit target B**. The list resets when you change map.
+- **Choose red zones** (under the Red zones switch) lists every red zone of the selected mission, with the team it applies to. Each zone has a number, shown in a badge on the map (2D and 3D) and in front of its entry in the list, so you can match them. Zones that are off keep a grey badge. Turn single zones off, or all of them with **All off**. A zone that's off is hidden and no longer counts for **Find highest point** and **Hit target B**. The list resets when you change map.
 - **Game mode and mission:** zones differ per mode (Arcade, Realistic, Simulator) and per mission.
 
 ## Good to know

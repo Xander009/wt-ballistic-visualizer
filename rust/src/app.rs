@@ -855,14 +855,29 @@ impl Viewer {
         .child(div().flex().flex_col().flex_1().min_w_0().child(div().text_sm().child(title.to_string())).when_some(sub, |d, s| d.child(div().text_xs().text_color(rgb(MUTED)).child(s.to_string()))))
     }
 
-    /// Fold-out list of the red zones of the selected mission and mode, each with its own switch.
-    fn red_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut zones: Vec<(String, Option<i64>)> = vec![];
+    /// The red zones of the selected mission and mode, numbered from 1 in list order: (name, team, label spot, on).
+    /// The label spot is the zone's centre, pulled inside the map when the zone reaches beyond it.
+    pub fn red_zones(&self) -> Vec<(String, Option<i64>, (f64, f64), bool)> {
+        let mut zones: Vec<(String, Option<i64>, (f64, f64), bool)> = vec![];
+        let Some(map) = &self.map else { return zones };
+        let t = &map.t;
+        let m = 40.0; // keep labels off the very edge
         for a in self.all_areas() {
             if a.kind == "kill" && !zones.iter().any(|z| z.0 == a.name) {
-                zones.push((a.name, a.team));
+                let (x, z) = match scene::area_shape(&a) {
+                    scene::Shape::Poly(p) => (p.iter().map(|q| q[0]).sum::<f64>() / 4.0, p.iter().map(|q| q[1]).sum::<f64>() / 4.0),
+                    scene::Shape::Circle { c, .. } => (c[0], c[1]),
+                };
+                let on = !self.hidden_red.contains(&a.name);
+                zones.push((a.name, a.team, (x.clamp(t.ox + m, t.x1 - m), z.clamp(t.oz + m, t.z1 - m)), on));
             }
         }
+        zones
+    }
+
+    /// Fold-out list of the red zones of the selected mission and mode, each with its own switch.
+    fn red_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let zones: Vec<(String, Option<i64>)> = self.red_zones().into_iter().map(|z| (z.0, z.1)).collect();
         let shown = zones.iter().filter(|z| !self.hidden_red.contains(&z.0)).count();
         let open = self.red_open;
         let names: Vec<String> = zones.iter().map(|z| z.0.clone()).collect();
@@ -879,9 +894,9 @@ impl Viewer {
                     .child(Button::new("red-none").label("All off").xsmall().on_click(cx.listener(move |this, _, _, cx| this.set_red(off_all.clone(), false, cx)))))
                 .children(zones.into_iter().enumerate().map(|(i, (name, team))| {
                     let label = name.replace('_', " ");
-                    let who = match team { Some(1) => "team 1", Some(2) => "team 2", _ => "both teams" };
+                    let who = match team { Some(1) => "team 1", Some(2) => "team 2", _ => "both" };
                     let n = name.clone();
-                    Checkbox::new(("red-zone", i)).checked(!self.hidden_red.contains(&name)).label(format!("{label} · {who}"))
+                    Checkbox::new(("red-zone", i)).checked(!self.hidden_red.contains(&name)).label(format!("{}.  {label} · {who}", i + 1))
                         .on_click(cx.listener(move |this, on: &bool, _, cx| this.set_red([n.clone()], *on, cx)))
                 }))
             })
