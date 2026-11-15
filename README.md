@@ -11,7 +11,7 @@ Windows may say "Windows protected your PC" because the file is not signed: clic
 ## Using it
 
 1. Pick a **Level**, **Tank** and **Shell** in the sidebar. The level and tank lists can be searched by typing.
-2. **Left click** the map to place your tank at **A**, and **right click** to place the target at **B**.
+2. **Left click** the map to place your tank at **A**, and **right click** to place the target at **B**. To take them off the map again, use **Remove A**, **Remove B** or **Remove both** in the **Aim A → B** card, or press **Delete** to remove both.
 3. The **Aim A → B** card shows:
    - the distance, and whether the sight line is clear;
    - for the low and high arc: whether it hits, the gun elevation, how far to aim over B, the flight time and the impact speed.
@@ -27,6 +27,7 @@ Windows may say "Windows protected your PC" because the file is not signed: clic
 | A / D (or ← / →) | steer A's tank |
 | R | map border on / off |
 | / | search levels |
+| Delete | remove A and B |
 
 Keys work after you click the map. The tank follows the slope of the ground, and A and B stand on top of rocks and objects.
 

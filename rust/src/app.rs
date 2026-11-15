@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
-    IndexPath, Sizable,
+    Disableable, IndexPath, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
@@ -535,6 +535,26 @@ impl Viewer {
         cx.notify();
     }
 
+    /// Take A and/or B off the map. A sweep result that needs a removed point (reach and visibility from A,
+    /// hit target B) goes with it, since it no longer matches anything on the map.
+    fn remove_points(&mut self, a: bool, b: bool, cx: &mut Context<Self>) {
+        if a {
+            self.a = None;
+            self.heading = None;
+            self.drive_keys.clear(); // stops driving
+        }
+        if b {
+            self.b = None;
+        }
+        if self.overlay.as_ref().is_some_and(|(ov, _)| match ov.kind {
+            SweepKind::Reach | SweepKind::View => a,
+            SweepKind::Hit => b,
+        }) {
+            self.overlay = None;
+        }
+        self.update_aim(cx);
+    }
+
     /// Zone layer for the current map, mission, mode and switches (cached).
     pub fn zone_layer(&mut self) -> Option<(&Layer, f64)> {
         let map = self.map.clone()?;
@@ -803,6 +823,7 @@ impl Viewer {
                 self.toggle(Sw::Border, on, cx);
             }
             "/" => self.map_sel.update(cx, |s, cx| s.focus(window, cx)),
+            "delete" | "backspace" => self.remove_points(true, true, cx),
             _ => {}
         }
     }
@@ -909,7 +930,8 @@ impl Viewer {
             Some(a) => scene::aim_lines(a, &self.params(cx)),
             None => vec![(if self.map.is_some() { "Left click A, right click B." } else { "Load a map." }.to_string(), 0)],
         };
-        let help = [("Left click", "firing point A"), ("Right click", "target B"), ("Wheel", "zoom (aim view: field of view)"), ("2D drag", "pan"), ("3D drag", "rotate; right or shift drag pans; double click centres"), ("W A S D", "drive A's tank: forward, back, steer (arrows too; click the map first)"), ("R", "map border on / off"), ("/", "search levels")];
+        let (has_a, has_b) = (self.a.is_some(), self.b.is_some());
+        let help = [("Left click", "firing point A"), ("Right click", "target B"), ("Wheel", "zoom (aim view: field of view)"), ("2D drag", "pan"), ("3D drag", "rotate; right or shift drag pans; double click centres"), ("W A S D", "drive A's tank: forward, back, steer (arrows too; click the map first)"), ("Delete", "remove A and B (click the map first)"), ("R", "map border on / off"), ("/", "search levels")];
         div().id("sidebar").w(px(340.)).h_full().flex_none().flex().flex_col().gap_3().p_3().overflow_y_scroll().bg(rgb(PANEL)).border_r_1().border_color(rgb(BORDER))
             .child(div().flex().items_center().gap_2().child(div().px_1p5().py_0p5().rounded_md().bg(rgb(COL_A)).text_color(rgb(0x111111)).font_weight(FontWeight::BOLD).child("WT"))
                 .child(div().flex().flex_col().child(div().font_weight(FontWeight::BOLD).child("Ballistic Visualizer")).child(div().text_xs().text_color(rgb(MUTED)).child("Ground battle maps, zones and shell arcs"))))
@@ -941,6 +963,10 @@ impl Viewer {
                 .child(div().flex().flex_col().font_family("Consolas").text_xs().children(aim_lines.into_iter().map(|(s, k)| {
                     div().min_h(px(14.)).text_color(rgb([0xd8dde2, 0x58c472, 0xe2574c][k as usize])).child(s)
                 })))
+                .child(div().flex().gap_2()
+                    .child(Button::new("rm-a").label("Remove A").small().flex_1().disabled(!has_a).on_click(cx.listener(|this, _, _, cx| this.remove_points(true, false, cx))))
+                    .child(Button::new("rm-b").label("Remove B").small().flex_1().disabled(!has_b).on_click(cx.listener(|this, _, _, cx| this.remove_points(false, true, cx))))
+                    .child(Button::new("rm-ab").label("Remove both").small().flex_1().disabled(!has_a && !has_b).on_click(cx.listener(|this, _, _, cx| this.remove_points(true, true, cx)))))
                 .child(self.switch("sw-arc", Sw::Arc, "Shell arc in 3D", Some("Path, drop curtain, apex and impact"), None, cx)))
             .child(card("Sweeps")
                 .child(div().flex().gap_2().child(field("3D terrain detail", Select::new(&self.detail_sel))).child(field("Sweep performance", Select::new(&self.perf_sel))))
