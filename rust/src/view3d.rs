@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gpui::{App, Bounds, Context, Pixels, RenderImage, Window, point, px};
 use wgpu::util::DeviceExt;
 
-use crate::app::{COL_A, COL_B, COL_BPT, COL_HIGH, Sw, TARGET_MODEL, Viewer};
+use crate::app::{COL_A, COL_AA, COL_B, COL_BPT, COL_HELI, COL_HIGH, COL_PLANE, Sw, TARGET_MODEL, Viewer};
 use crate::core::{Key, Pt, Terrain};
 use crate::paint::{self, color};
 use crate::scene;
@@ -116,7 +116,8 @@ impl View3D {
             return None;
         }
         let dir = [(b[0] - a[0]) / len, (b[1] - a[1]) / len, (b[2] - a[2]) / len];
-        let (lo, hi) = ([t.ox, t.lo - 1.0, t.oz], [t.x1, t.hi + 1.0, t.z1]);
+        let e = t.extent(); // the tank map, or the whole level around it (Max build)
+        let (lo, hi) = ([e[0], e[4] - 1.0, e[1]], [e[2], e[5] + 1.0, e[3]]);
         let (mut t0, mut t1) = (0.0f64, len);
         for i in 0..3 {
             if dir[i].abs() < 1e-12 {
@@ -149,7 +150,7 @@ impl View3D {
                 return Some(Pt { x: a[0] + dir[0] * h, z: a[2] + dir[2] * h });
             }
             prev = tc;
-            s += step;
+            s += step.max(s * 1e-3); // coarser far away: a ray over the whole level is tens of km long
         }
         None
     }
@@ -169,7 +170,12 @@ impl View3D {
             tgt = [c.tx, c.ty, c.tz];
             e = [tgt[0] - f[0] * c.dist, tgt[1] - f[1] * c.dist, tgt[2] - f[2] * c.dist];
             fov = ORBIT_FOV;
-            near = ((e[1] - t.height_at(e[0], e[2])) * 0.3).min(c.dist * 0.05).clamp(0.5, 100.0);
+            let map = v.map.as_ref().expect("map");
+            let g = match &map.far {
+                Some(f) if !t.inside(e[0], e[2]) => f.t.height_at(e[0], e[2]),
+                _ => t.height_at(e[0], e[2]),
+            };
+            near = ((e[1] - g) * 0.3).min(c.dist * 0.05).clamp(0.5, 100.0);
         }
         let mut proj = perspective(fov.to_radians(), w as f64 / h as f64, near, 80000.0);
         proj[0] = -proj[0]; // Dagor is left-handed: mirror X so +X stays screen-right as in the 2D map
@@ -185,7 +191,7 @@ impl View3D {
         (1..40).any(|k| {
             let f = k as f64 / 40.0 * 0.985;
             let (x, y, z) = (e[0] + (p[0] - e[0]) * f, e[1] + (p[1] - e[1]) * f, e[2] + (p[2] - e[2]) * f);
-            tr.inside(x, z) && tr.height_at(x, z) > y + 0.3
+            tr.reaches(x, z) && tr.height_at(x, z) > y + 0.3
         })
     }
 }
@@ -263,6 +269,16 @@ struct Uniforms {
     ov: [f32; 4],
     flags: [f32; 4],
     tiles: [f32; 32],
+    cut: [f32; 4],
+    cuts: [f32; 4 * MAX_CUTS],
+}
+/// Airfield and heli pad patches the whole level's terrain leaves out (more are drawn, over it)
+const MAX_CUTS: usize = 16;
+
+/// Max build: the selected mission's airfield and heli pad patches, each a small terrain of its own
+struct PatchRes {
+    key: usize,
+    list: Vec<(Arc<crate::core::Terrain>, wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 struct Pipes {
@@ -316,6 +332,15 @@ struct SceneRes {
     bind: Option<wgpu::BindGroup>,
 }
 
+/// Max build: the whole level around the tank map, view only: its terrain, colours, objects and trees
+/// (those inside the tank map are left out: the tank map has them), with its own uniforms.
+struct FarRes {
+    key: (usize, usize),
+    batches: Vec<Batch>,
+    trees: Vec<TreeBatch>,
+    bind: wgpu::BindGroup,
+}
+
 struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -335,6 +360,13 @@ struct Gpu {
     blank_arr: wgpu::Texture,
     scene: Option<SceneRes>,
     target: Option<Target>,
+    ubuf_far: wgpu::Buffer,
+    far_nodes: (wgpu::Buffer, u64),
+    far: Option<FarRes>,
+    /// the selected mission's object groups (airfields, heli pads, props), by pointer
+    groups: (usize, Vec<Batch>, Vec<TreeBatch>),
+    patches: Option<PatchRes>,
+    patch_nodes: (wgpu::Buffer, u64),
 }
 
 fn ptr<T>(a: &Arc<T>) -> usize {
@@ -433,10 +465,12 @@ impl Gpu {
         });
         let s_near = device.create_sampler(&wgpu::SamplerDescriptor { address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let ubuf_far = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let blank = texture(&device, &queue, 1, 1, 1, wgpu::TextureFormat::Rgba8Unorm, &[vec![0u8; 4]], 4);
         let blank_arr = texture_array(&device, &queue, 1, &[vec![vec![128u8; 4]]]);
         let tank_inst = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 128, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Ok(Self { nodes: (dynbuf(12 * 4096), 12 * 4096), lines: (dynbuf(28 * 4096), 28 * 4096), curtain: (dynbuf(28 * 4096), 28 * 4096), device, queue, bgl, pipes, ubuf, grid, trees, tanks: HashMap::new(), tank_inst, s_lin, s_near, blank, blank_arr, scene: None, target: None })
+        let (far_nodes, patch_nodes) = ((dynbuf(12 * 4096), 12 * 4096), (dynbuf(12 * 4096), 12 * 4096));
+        Ok(Self { nodes: (dynbuf(12 * 4096), 12 * 4096), lines: (dynbuf(28 * 4096), 28 * 4096), curtain: (dynbuf(28 * 4096), 28 * 4096), device, queue, bgl, pipes, ubuf, grid, trees, tanks: HashMap::new(), tank_inst, s_lin, s_near, blank, blank_arr, scene: None, target: None, ubuf_far, far_nodes, far: None, groups: (0, vec![], vec![]), patches: None, patch_nodes })
     }
 
     /// A vertex buffer of at least `size` bytes (grown, never shrunk) filled with `data`.
@@ -512,36 +546,7 @@ impl Gpu {
         }
         let objk = map.obj.as_ref().map_or(1, ptr);
         if s.obj.0 != objk {
-            let (mut batches, mut trees) = (vec![], vec![]);
-            if let Some(o) = &map.obj {
-                let mut per: Vec<Vec<usize>> = vec![vec![]; o.models.len()];
-                for (i, (m, _)) in o.inst.iter().enumerate() {
-                    if let Some(p) = per.get_mut(*m as usize) {
-                        p.push(i);
-                    }
-                }
-                for (mi, list) in per.iter().enumerate() {
-                    let m = &o.models[mi];
-                    if list.is_empty() || m.idx.is_empty() {
-                        continue;
-                    }
-                    let inst: Vec<f32> = list.iter().flat_map(|&i| o.inst[i].1.iter().copied().chain([1.0, 1.0, 1.0, 1.0])).collect();
-                    let gpu = Gpu::mesh_on(device, &m.pos, &m.nrm, &m.rgba, Some(&m.idx));
-                    batches.push(Batch { mesh: gpu, inst: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&inst), usage: wgpu::BufferUsages::VERTEX }), count: list.len() as u32 });
-                }
-                // trees: one batch per crown shape (rgba[3] of the tree model; older data has 255 there: by height)
-                let shape_of = |tm: &crate::data::TreeModel| if tm.rgba[3] <= 3 { tm.rgba[3] as usize } else if tm.height < 4.0 { 3 } else { 0 };
-                let mut by: [Vec<f32>; 4] = Default::default();
-                for (mi, f) in &o.trees {
-                    let Some(tm) = o.tree_models.get(*mi as usize) else { continue };
-                    by[shape_of(tm)].extend(f.iter().copied().chain([tm.height, tm.radius, tm.crown, 0.0, tm.rgba[0] as f32 / 255.0, tm.rgba[1] as f32 / 255.0, tm.rgba[2] as f32 / 255.0, 1.0]));
-                }
-                for (shape, list) in by.iter().enumerate() {
-                    if !list.is_empty() {
-                        trees.push(TreeBatch { shape, inst: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(list), usage: wgpu::BufferUsages::VERTEX }), count: (list.len() / 12) as u32 });
-                    }
-                }
-            }
+            let (batches, trees) = map.obj.as_ref().map_or((vec![], vec![]), |o| batches(device, o, |_| true));
             s.obj = (objk, batches, trees);
         }
         if changed {
@@ -564,6 +569,74 @@ impl Gpu {
                 ],
             }));
         }
+        // the whole level (Max build): a second terrain without the tank map's rect, and its objects outside it
+        let fk = (map.far.as_ref().map_or(0, ptr), v.far_img.as_ref().map_or(0, |l| ptr(&l.rgba)));
+        if fk.0 == 0 || fk.1 == 0 {
+            self.far = None;
+        } else if self.far.as_ref().is_none_or(|f| f.key != fk) {
+            let (f, img) = (map.far.as_ref().unwrap(), &v.far_img.as_ref().unwrap().rgba);
+            let ft = &f.t;
+            let h = texture(device, queue, ft.w as u32, ft.hh as u32, 1, wgpu::TextureFormat::R32Float, &[bytemuck::cast_slice(&ft.h).to_vec()], 4);
+            let c = rgba_texture(device, queue, img, true);
+            let inside = |p: [f32; 3]| (p[0] as f64) >= t.ox && (p[0] as f64) <= t.x1 && (p[2] as f64) >= t.oz && (p[2] as f64) <= t.z1;
+            let (batches, trees) = f.obj.as_ref().map_or((vec![], vec![]), |o| batches(device, o, |p| !inside(p)));
+            let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+            let arr = self.blank_arr.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            let (hv, cv, bv) = (view(&h), view(&c), view(&self.blank));
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.ubuf_far.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&hv) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&cv) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bv) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&bv) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&bv) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&arr) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.s_lin) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.s_near) },
+                ],
+            });
+            self.far = Some(FarRes { key: fk, batches, trees, bind });
+        }
+        // the mission's airfield and heli pad patches (they come with groups_cur)
+        let pk = match (&self.far, &v.groups_cur) { (Some(_), Some(g)) if !g.patches.is_empty() => ptr(&g.obj), _ => 0 };
+        if pk == 0 {
+            self.patches = None;
+        } else if self.patches.as_ref().is_none_or(|p| p.key != pk) {
+            let arr = self.blank_arr.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            let bv = self.blank.create_view(&Default::default());
+            let list = v.groups_cur.as_ref().unwrap().patches.iter().map(|(p, layer)| {
+                let pt = &p.t;
+                let h = texture(device, queue, pt.w as u32, pt.hh as u32, 1, wgpu::TextureFormat::R32Float, &[bytemuck::cast_slice(&pt.h).to_vec()], 4);
+                let c = rgba_texture(device, queue, &layer.rgba, true);
+                let ub = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                let (hv, cv) = (h.create_view(&Default::default()), c.create_view(&Default::default()));
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&hv) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&cv) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bv) },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&bv) },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&bv) },
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&arr) },
+                        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.s_lin) },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.s_near) },
+                    ],
+                });
+                (p.t.clone(), ub, bind)
+            }).collect();
+            self.patches = Some(PatchRes { key: pk, list });
+        }
+        let gk = v.groups_cur.as_ref().map_or(0, |g| ptr(&g.obj));
+        if self.groups.0 != gk {
+            let (b, tr) = v.groups_cur.as_ref().map_or((vec![], vec![]), |g| batches(device, &g.obj, |_| true));
+            self.groups = (gk, b, tr);
+        }
         // tank models, kept across maps
         for (model, mesh) in &v.tanks {
             if let (Some(m), false) = (mesh, self.tanks.contains_key(model)) {
@@ -585,6 +658,41 @@ impl Gpu {
             verts: (pos.len() / 3) as u32,
         }
     }
+}
+
+/// Instanced draws of the objects (one batch per model) and trees (one per crown shape) whose position `keep` accepts.
+fn batches(device: &wgpu::Device, o: &crate::data::Objects, keep: impl Fn([f32; 3]) -> bool) -> (Vec<Batch>, Vec<TreeBatch>) {
+    let (mut batches, mut trees) = (vec![], vec![]);
+    let mut per: Vec<Vec<usize>> = vec![vec![]; o.models.len()];
+    for (i, (m, f)) in o.inst.iter().enumerate() {
+        if let (Some(p), true) = (per.get_mut(*m as usize), keep([f[9], f[10], f[11]])) {
+            p.push(i);
+        }
+    }
+    for (mi, list) in per.iter().enumerate() {
+        let m = &o.models[mi];
+        if list.is_empty() || m.idx.is_empty() {
+            continue;
+        }
+        let inst: Vec<f32> = list.iter().flat_map(|&i| o.inst[i].1.iter().copied().chain([1.0, 1.0, 1.0, 1.0])).collect();
+        let gpu = Gpu::mesh_on(device, &m.pos, &m.nrm, &m.rgba, Some(&m.idx));
+        batches.push(Batch { mesh: gpu, inst: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&inst), usage: wgpu::BufferUsages::VERTEX }), count: list.len() as u32 });
+    }
+    // trees: one batch per crown shape (rgba[3] of the tree model; older data has 255 there: by height)
+    let shape_of = |tm: &crate::data::TreeModel| if tm.rgba[3] <= 3 { tm.rgba[3] as usize } else if tm.height < 4.0 { 3 } else { 0 };
+    let mut by: [Vec<f32>; 4] = Default::default();
+    for (mi, f) in &o.trees {
+        let Some(tm) = o.tree_models.get(*mi as usize) else { continue };
+        if keep([f[0], f[1], f[2]]) {
+            by[shape_of(tm)].extend(f.iter().copied().chain([tm.height, tm.radius, tm.crown, 0.0, tm.rgba[0] as f32 / 255.0, tm.rgba[1] as f32 / 255.0, tm.rgba[2] as f32 / 255.0, 1.0]));
+        }
+    }
+    for (shape, list) in by.iter().enumerate() {
+        if !list.is_empty() {
+            trees.push(TreeBatch { shape, inst: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(list), usage: wgpu::BufferUsages::VERTEX }), count: (list.len() / 12) as u32 });
+        }
+    }
+    (batches, trees)
 }
 
 /// Box-filtered mip chain of an RGBA image (wgpu does not generate mipmaps).
@@ -722,7 +830,7 @@ fn build_lines(v: &Viewer) -> (Vec<f32>, Vec<f32>) {
         l.extend(b.iter().map(|&x| x as f32).chain(c).chain([1.0]));
     };
     for a in v.areas() {
-        let shown = match a.kind.as_str() { "battle" => v.sw.on(Sw::Border), "kill" => v.sw.on(Sw::Red), _ => v.sw.on(Sw::Caps) };
+        let shown = match a.kind.as_str() { "battle" => v.sw.on(Sw::Border), "kill" => v.sw.on(Sw::Red), "airspawn" => false, _ => v.sw.on(Sw::Caps) };
         if !shown {
             continue;
         }
@@ -737,12 +845,36 @@ fn build_lines(v: &Viewer) -> (Vec<f32>, Vec<f32>) {
             let n = ((x1 - x0).hypot(z1 - z0) / (2.0 * t.cell)).ceil().max(1.0) as usize;
             for k in if i > 1 { 1 } else { 0 }..=n {
                 let (x, z) = (x0 + (x1 - x0) * k as f64 / n as f64, z0 + (z1 - z0) * k as f64 / n as f64);
-                pts.push(t.inside(x, z).then(|| [x, t.height_at(x, z) + 0.5, z])); // outlines stop at the terrain's edge
+                pts.push(t.reaches(x, z).then(|| [x, t.height_at(x, z) + 0.5, z])); // outlines stop at the terrain's edge
             }
         }
         for w in pts.windows(2) {
             if let [Some(a), Some(b)] = w {
                 seg(&mut l, *a, *b, col);
+            }
+        }
+    }
+    if v.sw.on(Sw::Air) {
+        // spawn spots: a short pole each; air spawns: their ring at their height, on a pole from the ground
+        if let (Some(g), Some(groups)) = (&v.groups_cur, &map.groups) {
+            for (_, kind, x, y, z) in groups.spawns.iter().filter(|s| g.tags.contains(&s.0)) {
+                seg(&mut l, [*x, *y, *z], [*x, *y + 12.0, *z], rgb(if kind == "heli" { COL_HELI } else { COL_PLANE }));
+            }
+        }
+        if map.far.is_some() {
+            for (_, _, x, z, _, _) in map.meta.missions.get(v.mission).map_or(&[][..], |ms| &ms.aa[..]).iter().filter(|a| v.in_rank(Some([a.4, a.5]))) {
+                let g = map.stand(*x, *z);
+                seg(&mut l, [*x, g, *z], [*x, g + 20.0, *z], rgb(COL_AA));
+            }
+        }
+        for a in v.areas().iter().filter(|a| a.kind == "airspawn") {
+            if let scene::Shape::Circle { c, r } = scene::area_shape(a) {
+                let (col, y) = (rgb(scene::area_color(a)), a.tm[3][1]);
+                let ring: Vec<[f64; 3]> = (0..=64).map(|i| { let f = i as f64 * std::f64::consts::PI / 32.0; [c[0] + r * f.sin(), y, c[1] + r * f.cos()] }).collect();
+                for w in ring.windows(2) {
+                    seg(&mut l, w[0], w[1], col);
+                }
+                seg(&mut l, [c[0], t.height_at(c[0], c[1]), c[1]], [c[0], y, c[1]], col);
             }
         }
     }
@@ -758,6 +890,16 @@ fn build_lines(v: &Viewer) -> (Vec<f32>, Vec<f32>) {
         seg(&mut l, [a.x, aim.y_a, a.z], [b.x, aim.y_b, b.z], rgb(if aim.los.is_none() { 0x58c472 } else { 0xe2574c }));
         for (i, q) in aim.sols.iter().enumerate() {
             let col = rgb(if i > 0 { COL_B } else { COL_A });
+            // where the shells can land, on the ground, and the cone they fly in: from the muzzle to their ring at B
+            for w in q.spread.iter().chain(q.spread.first()).collect::<Vec<_>>().windows(2) {
+                seg(&mut l, [w[0][0], w[0][1] + 0.3, w[0][2]], [w[1][0], w[1][1] + 0.3, w[1][2]], col);
+            }
+            for w in q.ring.iter().chain(q.ring.first()).collect::<Vec<_>>().windows(2) {
+                seg(&mut l, *w[0], *w[1], col);
+            }
+            for r in q.ring.iter().step_by((q.ring.len() / 4).max(1)) {
+                seg(&mut l, [a.x, aim.y_a, a.z], *r, col);
+            }
             let mut pts: Vec<[f64; 3]> = (0..q.tr.s.len()).step_by(2).take_while(|&k| q.tr.s[k] <= aim.d).map(|k| [a.x + aim.dir.0 * q.tr.s[k], q.tr.y[k], a.z + aim.dir.1 * q.tr.s[k]]).collect();
             pts.push([b.x, q.tr.at(Key::Y, aim.d), b.z]);
             for w in pts.windows(2) {
@@ -829,6 +971,7 @@ pub fn prepare(v: &mut Viewer, window: &mut Window, cx: &mut Context<Viewer>) {
         return;
     }
     v.zone_layer(); // the zone texture is shared with 2D and built on demand
+    v.sync_groups();
     let scale = window.scale_factor();
     let (w, h) = (f32::from(v.map_bounds().size.width).max(16.0), f32::from(v.map_bounds().size.height).max(16.0));
     let mut st = std::collections::hash_map::DefaultHasher::new();
@@ -836,7 +979,8 @@ pub fn prepare(v: &mut Viewer, window: &mut Window, cx: &mut Context<Viewer>) {
     for f in [c.tx, c.ty, c.tz, c.yaw, c.pitch, c.dist, c.aim_fov, c.zoom, w as f64, h as f64, scale as f64] {
         f.to_bits().hash(&mut st);
     }
-    (v.aim_ready(), v.view_mode as u8, v.detail, v.sw_bits(), v.mission, v.mode as u8, v.tanks.values().filter(|m| m.is_some()).count(), v.tank).hash(&mut st);
+    (v.aim_ready(), v.view_mode as u8, v.detail, v.sw_bits(), v.mission, v.rank, v.mode as u8, v.tanks.values().filter(|m| m.is_some()).count(), v.tank).hash(&mut st);
+    (v.far_img.as_ref().map(|l| ptr(&l.rgba)), v.groups_cur.as_ref().map(|g| ptr(&g.obj))).hash(&mut st);
     (v.map.as_ref().map(ptr), v.map_img.as_ref().map(|l| ptr(&l.rgba)), v.zones_img.as_ref().map(|z| ptr(&z.1.rgba)), v.overlay.as_ref().map(|o| ptr(&o.1.rgba))).hash(&mut st);
     let key = st.finish();
     if key == v.v3.key && !v.v3.dirty && v.v3.frame.is_some() {
@@ -862,6 +1006,7 @@ impl View3D {
         if self.gpu.is_none() {
             self.gpu = Some(Gpu::new()?);
         }
+        self.gpu.as_mut().unwrap().sync(v); // first: the node lists below follow what it holds (patches)
         self.camera(v, w, h);
         let map = v.map.as_ref().expect("map");
         let t = &map.t;
@@ -869,13 +1014,27 @@ impl View3D {
         let root = P.max((t.w.max(t.hh) as f64 - 1.0).log2().ceil().exp2() as usize);
         collect(t, self.eye, &frustum(&self.vp), 0, 0, root, &mut nodes, LODK[v.detail.min(3)]);
         self.n_patches = nodes.len() / 3;
+        let mut far_nodes = vec![];
+        if let Some(f) = &map.far {
+            let froot = P.max((f.t.w.max(f.t.hh) as f64 - 1.0).log2().ceil().exp2() as usize);
+            collect(&f.t, self.eye, &frustum(&self.vp), 0, 0, froot, &mut far_nodes, LODK[v.detail.min(3)]);
+        }
+        // airfield and heli pad patches: one node list, an instance range each
+        let (mut patch_nodes, mut patch_ranges) = (vec![], vec![]);
+        for (pt, _, _) in self.gpu.as_ref().and_then(|g| g.patches.as_ref()).map_or(&[][..], |p| &p.list[..]) {
+            let start = patch_nodes.len() / 3;
+            let proot = P.max((pt.w.max(pt.hh) as f64 - 1.0).log2().ceil().exp2() as usize);
+            collect(pt, self.eye, &frustum(&self.vp), 0, 0, proot, &mut patch_nodes, LODK[v.detail.min(3)]);
+            patch_ranges.push(start as u32..(patch_nodes.len() / 3) as u32);
+        }
         let (lines, curtain) = build_lines(v);
 
         let gpu = self.gpu.as_mut().unwrap();
-        gpu.sync(v);
         let (pw, ph) = ((w * scale).round() as u32, (h * scale).round() as u32);
         gpu.target(pw, ph);
         Gpu::stream(&gpu.device, &gpu.queue, &mut gpu.nodes, bytemuck::cast_slice(&nodes));
+        Gpu::stream(&gpu.device, &gpu.queue, &mut gpu.far_nodes, bytemuck::cast_slice(&far_nodes));
+        Gpu::stream(&gpu.device, &gpu.queue, &mut gpu.patch_nodes, bytemuck::cast_slice(&patch_nodes));
         Gpu::stream(&gpu.device, &gpu.queue, &mut gpu.lines, bytemuck::cast_slice(&lines));
         Gpu::stream(&gpu.device, &gpu.queue, &mut gpu.curtain, bytemuck::cast_slice(&curtain));
         let s = gpu.scene.as_ref().unwrap();
@@ -893,8 +1052,35 @@ impl View3D {
             ov,
             flags: [f32::from(u8::from(v.sw.on(Sw::Grid))), f32::from(u8::from(v.sw.on(Sw::GroundDetail) && s.det.0 != 1)), 0.0, 0.0],
             tiles: s.det.3,
+            cut: [0.0; 4],
+            cuts: [0.0; 4 * MAX_CUTS],
         };
         gpu.queue.write_buffer(&gpu.ubuf, 0, bytemuck::bytes_of(&u));
+        if let (Some(f), Some(_)) = (&map.far, &gpu.far) {
+            let ft = &f.t;
+            let water = f.meta.water.unwrap_or(0.0) as f32;
+            // a small terrain's uniforms: no 100 m grid (over kilometres it turns the ground grey), no overlay
+            let of = |g: &crate::core::Terrain, cuts: [f32; 4 * MAX_CUTS], n: usize| Uniforms {
+                map: [g.ox as f32, g.oz as f32, g.cell as f32, water],
+                uv: [(g.ox - g.cell / 2.0) as f32, (g.oz - g.cell / 2.0) as f32, (1.0 / (g.w as f64 * g.cell)) as f32, (1.0 / (g.hh as f64 * g.cell)) as f32],
+                ov: [0.0; 4],
+                flags: [0.0, 0.0, n as f32, 0.0],
+                cut: [t.ox as f32, t.oz as f32, t.x1 as f32, t.z1 as f32],
+                cuts,
+                ..u
+            };
+            let mut cuts = [0.0; 4 * MAX_CUTS];
+            let list = gpu.patches.as_ref().map_or(&[][..], |p| &p.list[..]);
+            for (k, (pt, ub, _)) in list.iter().enumerate() {
+                if k < MAX_CUTS {
+                    // 2 cells inside the patch: the whole level's ground reaches under its edge, no crack between them
+                    let e = 2.0 * pt.cell;
+                    cuts[k * 4..k * 4 + 4].copy_from_slice(&[(pt.ox + e) as f32, (pt.oz + e) as f32, (pt.x1 - e) as f32, (pt.z1 - e) as f32]);
+                }
+                gpu.queue.write_buffer(ub, 0, bytemuck::bytes_of(&of(pt, [0.0; 4 * MAX_CUTS], 0)));
+            }
+            gpu.queue.write_buffer(&gpu.ubuf_far, 0, bytemuck::bytes_of(&of(ft, cuts, list.len().min(MAX_CUTS))));
+        }
         // tanks: A = the picked tank (not in the aim view: the camera sits in it) along its driven heading, else
         // facing B; B = the target facing A. Both pitch and roll with the surface under them.
         let mut tank_draws: Vec<(&Mesh, u64)> = vec![];
@@ -945,6 +1131,19 @@ impl View3D {
             rp.set_vertex_buffer(1, gpu.nodes.0.slice(..));
             rp.set_index_buffer(gpu.grid.1.slice(..), wgpu::IndexFormat::Uint16);
             rp.draw_indexed(0..gpu.grid.2, 0, 0..self.n_patches as u32);
+            if let Some(f) = &gpu.far {
+                rp.set_bind_group(0, &f.bind, &[]);
+                rp.set_vertex_buffer(1, gpu.far_nodes.0.slice(..));
+                rp.draw_indexed(0..gpu.grid.2, 0, 0..(far_nodes.len() / 3) as u32);
+                if let Some(pr) = &gpu.patches {
+                    rp.set_vertex_buffer(1, gpu.patch_nodes.0.slice(..));
+                    for ((_, _, bind), range) in pr.list.iter().zip(&patch_ranges) {
+                        rp.set_bind_group(0, bind, &[]);
+                        rp.draw_indexed(0..gpu.grid.2, 0, range.clone());
+                    }
+                }
+                rp.set_bind_group(0, s.bind.as_ref().unwrap(), &[]);
+            }
             let draw_mesh = |rp: &mut wgpu::RenderPass, m: &Mesh, inst: wgpu::BufferSlice, count: u32| {
                 rp.set_vertex_buffer(0, m.pos.slice(..));
                 rp.set_vertex_buffer(1, m.nrm.slice(..));
@@ -960,16 +1159,16 @@ impl View3D {
             };
             rp.set_pipeline(&p.build);
             if v.sw.on(Sw::Build) {
-                for b in &s.obj.1 {
+                for b in s.obj.1.iter().chain(gpu.far.iter().flat_map(|f| &f.batches)).chain(&gpu.groups.1) {
                     draw_mesh(&mut rp, &b.mesh, b.inst.slice(..), b.count);
                 }
             }
             for (m, off) in &tank_draws {
                 draw_mesh(&mut rp, m, gpu.tank_inst.slice(*off..*off + 64), 1);
             }
-            if v.sw.on(Sw::Trees) && !s.obj.2.is_empty() {
+            if v.sw.on(Sw::Trees) {
                 rp.set_pipeline(&p.tree);
-                for tb in &s.obj.2 {
+                for tb in s.obj.2.iter().chain(gpu.far.iter().flat_map(|f| &f.trees)).chain(&gpu.groups.2) {
                     let (vb, n) = &gpu.trees[tb.shape];
                     rp.set_vertex_buffer(0, vb.slice(..));
                     rp.set_vertex_buffer(1, tb.inst.slice(..));
@@ -979,6 +1178,14 @@ impl View3D {
             if map.meta.water.is_some() && v.sw.on(Sw::Water) {
                 rp.set_pipeline(&p.water);
                 rp.draw(0..4, 0..1);
+            }
+            if let (Some(f), Some(fr), true) = (&map.far, &gpu.far, v.sw.on(Sw::Water)) {
+                if f.meta.water.is_some() {
+                    rp.set_pipeline(&p.water);
+                    rp.set_bind_group(0, &fr.bind, &[]);
+                    rp.draw(0..4, 0..1);
+                    rp.set_bind_group(0, s.bind.as_ref().unwrap(), &[]);
+                }
             }
             if !curtain.is_empty() {
                 rp.set_pipeline(&p.curtain);
@@ -1087,9 +1294,69 @@ pub fn paint(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut Ap
             paint::mono(window, cx, &format!("{head}{}", if aim.sols.is_empty() { ", no firing solution" } else { "" }), paint::p(ox + 10.0, oy + 8.0), color(0xffffff, 1.0), 12.0);
         }
     }
+    // the compass reads where the view looks: from A at B, else the orbit camera's heading
+    let look = match (aim_mode, v.a, v.b) {
+        (true, Some(a), Some(b)) => (b.x - a.x).atan2(b.z - a.z),
+        _ => v3.cam.yaw,
+    };
+    draw_compass(window, cx, ox + v3.wh.0 / 2.0, oy + 46.0, look, v.hull_heading(), v.a.zip(v.b).map(|(a, b)| (b.x - a.x).atan2(b.z - a.z))); // under the buttons over the map
     if matches!(v.view_mode, crate::app::ViewMode::Aim | crate::app::ViewMode::Sight) && !aim_mode {
         paint::mono(window, cx, "Aim and sight views: place A (left click) and B (right click). Showing orbit camera.", paint::p(ox + 10.0, oy + 8.0), color(0xffffff, 1.0), 12.0);
     }
+}
+
+/// The game's compass: a strip at the top, the heading `az` (rad) under the centre mark and read out below it, a
+/// tick every 5°, numbers every 15° and N, NE, E... at their bearings; `hull` (A's hull heading) is a small marker,
+/// `to_b` (the bearing from A to B) a blue line and arrow, at the strip's end when off it.
+#[allow(clippy::too_many_arguments)]
+fn draw_compass(window: &mut Window, cx: &mut App, x0: f32, y: f32, az: f64, hull: Option<f64>, to_b: Option<f64>) {
+    const HALF: f64 = 60.0; // degrees shown each side of the heading
+    const W: f32 = 210.0; // pixels each side
+    let k = W / HALF as f32;
+    let head = az.to_degrees();
+    let white = color(0xffffff, 0.95);
+    window.paint_quad(gpui::fill(Bounds::new(paint::p(x0 - W - 14.0, y), gpui::size(px(2.0 * W + 28.0), px(30.))), color(0x000000, 0.35)));
+    let mono_w = |s: &str, size: f32| s.chars().count() as f32 * size * 0.55; // Consolas advance
+    for i in ((head - HALF) / 5.0).ceil() as i64..=((head + HALF) / 5.0).floor() as i64 {
+        let d = i * 5;
+        let x = x0 + (d as f64 - head) as f32 * k;
+        let big = d % 15 == 0;
+        paint::stroke(window, &[paint::p(x, y + 30.0 - if big { 9.0 } else { 5.0 }), paint::p(x, y + 30.0)], 1.2, white, None, false);
+        if big {
+            let b = d.rem_euclid(360);
+            let s = match b { 0 => "N".into(), 45 => "NE".into(), 90 => "E".into(), 135 => "SE".into(), 180 => "S".into(), 225 => "SW".into(), 270 => "W".into(), 315 => "NW".into(), _ => b.to_string() };
+            let size = if b % 45 == 0 { 13.0 } else { 11.0 };
+            paint::mono(window, cx, &s, paint::p(x - mono_w(&s, size) / 2.0, y + 3.0), if b == 0 { color(0xff6b5e, 1.0) } else { white }, size);
+        }
+    }
+    if let Some(hh) = hull {
+        let d = (hh.to_degrees() - head + 540.0).rem_euclid(360.0) - 180.0;
+        if d.abs() <= HALF {
+            let x = x0 + d as f32 * k;
+            paint::fill(window, &[paint::p(x, y + 30.0), paint::p(x - 5.0, y + 38.0), paint::p(x + 5.0, y + 38.0)], color(COL_A, 1.0));
+        }
+    }
+    if let Some(tb) = to_b {
+        let blue = color(COL_BPT, 1.0);
+        let d = (tb.to_degrees() - head + 540.0).rem_euclid(360.0) - 180.0;
+        let label = format!("B {:03}°", crate::scene::compass_deg(tb));
+        if d.abs() <= HALF {
+            let x = x0 + d as f32 * k;
+            paint::stroke(window, &[paint::p(x, y), paint::p(x, y + 30.0)], 2.0, blue, None, false);
+            paint::fill(window, &[paint::p(x, y + 6.0), paint::p(x - 6.0, y - 3.0), paint::p(x + 6.0, y - 3.0)], blue);
+            let lx = if (x - x0).abs() < 30.0 { x0 + 26.0 } else { x + 6.0 }; // clear of the heading readout
+            paint::mono(window, cx, &label, paint::p(lx, y + 31.0), blue, 12.0);
+        } else {
+            // off the strip: an arrow at the end B lies past
+            let s = d.signum() as f32;
+            let x = x0 + s * (W + 14.0);
+            paint::fill(window, &[paint::p(x + s * 10.0, y + 15.0), paint::p(x, y + 7.0), paint::p(x, y + 23.0)], blue);
+            paint::mono(window, cx, &label, paint::p(if s > 0.0 { x + 14.0 } else { x - 14.0 - mono_w(&label, 12.0) }, y + 8.0), blue, 12.0);
+        }
+    }
+    paint::stroke(window, &[paint::p(x0, y + 17.0), paint::p(x0, y + 34.0)], 2.0, color(0xffd54a, 1.0), None, false);
+    let s = format!("{:03}°", crate::scene::compass_deg(az));
+    paint::mono(window, cx, &s, paint::p(x0 - mono_w(&s, 13.0) / 2.0, y + 40.0), white, 13.0);
 }
 
 /// Shell arcs: thick path with a dark edge, faint and dashed where terrain or roofs hide it, a dot every 0.5 s,

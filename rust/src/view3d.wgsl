@@ -11,6 +11,8 @@ struct U {
     ov: vec4<f32>,      // sweep overlay origin x, z, 1 / size, on
     flags: vec4<f32>,   // grid on, ground detail on
     tiles: array<vec4<f32>, 8>, // detail texture tile sizes in metres (32)
+    cut: vec4<f32>,     // x0, z0, x1, z1: the whole level's terrain and water leave this out (the tank map is there)
+    cuts: array<vec4<f32>, 16>, // more such rects, flags.z of them (the whole level: under the airfield and heli pad patches)
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tH: texture_2d<f32>;        // heights, row j = z index j
@@ -27,8 +29,20 @@ fn fog(col: vec3f, p: vec3f) -> vec3f {
 }
 // red zones and outside the map edge, painted on every surface
 fn zones(col: vec3f, p: vec3f) -> vec3f {
-    let zn = textureSampleLevel(tZ, sLin, (p.xz - u.zn.xy) * u.zn.z, 0.0);
-    return mix(col, zn.rgb, zn.a);
+    let uv = (p.xz - u.zn.xy) * u.zn.z;
+    let zn = textureSampleLevel(tZ, sLin, uv, 0.0);
+    // outside the zone layer (the whole level's objects, Max build) nothing: the edge texels would clamp out
+    return mix(col, zn.rgb, select(0.0, zn.a, all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0))));
+}
+fn in_rect(r: vec4f, p: vec3f) -> bool {
+    return r.z > r.x && all(p.xz > r.xy) && all(p.xz < r.zw);
+}
+fn cut_out(p: vec3f) -> bool {
+    var out = in_rect(u.cut, p);
+    for (var k = 0; k < i32(u.flags.z); k++) {
+        out = out || in_rect(u.cuts[k], p);
+    }
+    return out;
 }
 fn tile(i: i32) -> f32 {
     return u.tiles[i / 4][i % 4];
@@ -47,6 +61,7 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) p: vec3f };
 }
 @fragment fn fs_terrain(i: TOut) -> @location(0) vec4f {
     let p = i.p;
+    if (cut_out(p)) { discard; }
     let uv = (p.xz - u.uv.xy) * u.uv.zw;
     var col = textureSample(tC, sLin, uv).rgb;
     // the game's tiled ground detail up close, as a brightness pattern over the colour map
@@ -163,6 +178,7 @@ fn vn(p: vec2f) -> f32 {
 fn waves(p: vec2f) -> f32 { return vn(p * 0.18) + 0.5 * vn(p * 0.47 + 3.1) + 0.25 * vn(p * 1.3 + 7.7); }
 @fragment fn fs_water(i: WOut) -> @location(0) vec4f {
     let p = i.p;
+    if (in_rect(u.cut, p)) { discard; } // the tank map's own water is there; under patches the sea stays
     let size = vec2i(textureDimensions(tH));
     let c = clamp(vec2i(floor((p.xz - u.map.xy) / u.map.z + 0.5)), vec2i(0), size - 1);
     let depth = p.y - textureLoad(tH, c, 0).r;

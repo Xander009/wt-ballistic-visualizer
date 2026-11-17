@@ -1,8 +1,21 @@
 //! Exports the placed objects, trees and ground colours of War Thunder levels for the visualizer.
 //!
 //! `wtv-objects <game dir> <jobs file>`. Each line of the jobs file is
-//! `<level> <out base> <ox> <oz> <cell> <width> <height>`: the level name, where to write, and the heightmap
-//! grid the browser uses. Writes `<out base>.obj` and, when the level has land-class data, `<out base>.ground`.
+//! `<level> <out base> <ox> <oz> <cell> <width> <height> [<placements file>]`: the level name, where to write,
+//! and the heightmap grid the browser uses. Writes `<out base>.obj` and, when the level has land-class data,
+//! `<out base>.ground`.
+//!
+//! With a placements file the objects come from it instead of the level (the missions' object groups: airfields,
+//! heli pads, props), and there are no grids (w = h = 0) and no ground. Each of its lines is
+//! `<tag> <model> <tm: 12 floats, rows>`; the model is a RendInst, else a DynModel (runway and pad slabs).
+//! The `.obj` then ends with `u32 n, u32 tag[n]` per instance and `u32 n, u32 tag[n]` per tree.
+//!
+//! A line `slab <model> <out base>` exports the ground slab of an airfield or heli pad (a `^^` DynModel: the
+//! surface the game puts there, with its painted texture) to `<out base>.slab`: `u32 parts`, then per textured
+//! part `u32 tex, u32 blend, u32 nv, nv x (f32 x y z u v), u32 ni, u32 idx[ni]`; and each texture it uses to
+//! `<out base>.<tex>.rgba` (`u32 w, u32 h, rgba`). blend (from the material's shader): 0 over the ground by the
+//! texture's alpha, 1 opaque. Parts that only blend the slab into the landmesh, grime decals that modulate the
+//! ground (stains, leaks, tyre marks: noise at the app's 0.5 to 2 m) and placeholder textures are left out.
 //!
 //! `.obj`, little endian, every block 4-byte aligned:
 //! ```text
@@ -30,7 +43,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use wt_formats::grp::GrpPack;
+use wt_formats::grp::{class_id, GrpPack};
 use wt_unpack::blk::{Block, Value};
 use wt_unpack::collision::{Collision, CollisionNode, NodeKind, COLLISION};
 use wt_unpack::landclass::{decode_colormaps, GroundBaker, GroundMaterial, GroundWeights, LandClassKind, LandClassMaterial};
@@ -40,6 +53,8 @@ use wt_unpack::rendinst::{is_facing_leaves, model_descs, ResourceIndex, RiModel,
 use wt_unpack::texlib::TextureLibrary;
 use wt_unpack::vehicle;
 
+/// Placement name of a runway or heli pad surface (from an object group's airfield block)
+const RUNWAY: &str = "__runway__";
 const MIN_HEIGHT: f32 = 2.5;
 const MIN_AREA: f32 = 6.0;
 /// Objects smaller than this in every direction (pebbles, litter) are not drawn
@@ -106,6 +121,11 @@ struct Ctx {
     kinds: HashMap<String, Kind>,
     meshes: Vec<Mesh>,
     trees: Vec<TreeModel>,
+    game: PathBuf,
+    /// DynModel loader, opened on the first DynModel (it indexes every texture)
+    lib: Option<Option<vehicle::Library>>,
+    /// dynModelDesc.bin (DynModel materials), read on the first slab
+    dyn_descs: Option<HashMap<String, Block>>,
 }
 
 fn resource(index: &ResourceIndex, class: u32, name: &str) -> Result<Option<Vec<u8>>> {
@@ -198,6 +218,12 @@ impl Ctx {
     }
 
     fn classify(&mut self, name: &str) -> Kind {
+        if name == RUNWAY {
+            // a concrete unit square; the placement scales it to the runway or pad (see extract.py expand_group)
+            let (p, rgba) = ([[-0.5, 0.0, -0.5], [0.5, 0.0, -0.5], [0.5, 0.0, 0.5], [-0.5, 0.0, 0.5]], [128, 128, 124, 255]);
+            self.meshes.push(Mesh { pos: p.to_vec(), nrm: vec![[0.0, 1.0, 0.0]; 4], rgba: vec![rgba; 4], idx: vec![0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2] });
+            return Kind::Object { mesh: Some(self.meshes.len() - 1), shot: Vec::new(), drawn: true };
+        }
         let model = resource(&self.index, REND_INST, name).ok().flatten().and_then(|d| RiModel::parse(&d).ok());
         let mats = materials(self.descs.get(name));
         let leafy = model.as_ref().is_some_and(|m| m.has_impostor) || mats.iter().any(|(c, _)| is_facing_leaves(c));
@@ -246,6 +272,9 @@ impl Ctx {
             (Vec::new(), Vec::new())
         });
         let mut mesh = model.as_ref().and_then(|m| self.render_mesh(m, &mats));
+        if model.is_none() && mesh.is_none() {
+            mesh = self.dyn_mesh(name);
+        }
         if mesh.is_none() && !all.is_empty() {
             mesh = Some(Mesh {
                 pos: all.iter().flatten().copied().collect(),
@@ -272,6 +301,46 @@ impl Ctx {
             self.meshes.len() - 1
         });
         Kind::Object { mesh: id, shot, drawn: ext >= MIN_DRAWN }
+    }
+
+    /// A DynModel (mission object groups' runway and heli pad slabs): the first LOD under the triangle budget,
+    /// each material coloured by its texture's average.
+    fn dyn_mesh(&mut self, name: &str) -> Option<Mesh> {
+        let path = self.index.find(class_id::DYN_MODEL, name)?.to_path_buf();
+        let game = self.game.clone();
+        let lib = self.lib.get_or_insert_with(|| vehicle::Library::open(&game).map_err(|e| eprintln!("  DynModels off: {e:#}")).ok()).as_ref()?;
+        let tris = |v: &vehicle::Vehicle| v.meshes.iter().filter(|m| !m.skinned).map(|m| m.indices.len() / 3).sum::<usize>();
+        let mut lod = 0;
+        while lib.load_geometry(&path, name, lod + 1).is_ok() && lib.load_geometry(&path, name, lod).is_ok_and(|v| tris(&v) > MAX_TRIS) {
+            lod += 1;
+        }
+        let v = lib.load(&path, name, lod).map_err(|e| eprintln!("  {name}: {e:#}")).ok()?;
+        let mut m = Mesh { pos: Vec::new(), nrm: Vec::new(), rgba: Vec::new(), idx: Vec::new() };
+        for part in v.meshes.iter().filter(|p| !p.skinned) {
+            // the slabs are few big triangles over a painted texture (runway, markings, grass): each vertex takes
+            // the texture's colour around its UV, averaged over a 9 x 9 texel patch
+            let img = v.materials.get(part.material).and_then(|mat| mat.color.as_ref()).filter(|i| i.width > 0 && i.height > 0);
+            let sample = |uv: [f32; 2]| -> [u8; 4] {
+                let Some(img) = img else { return [118, 120, 92, 255] }; // untextured slab: a ground tone, it flattens the ground
+                let (w, h) = (img.width as i64, img.height as i64);
+                let (cx, cy) = ((uv[0].rem_euclid(1.0) * w as f32) as i64, (uv[1].rem_euclid(1.0) * h as f32) as i64);
+                let mut acc = [0u32; 3];
+                for dy in -4..=4 {
+                    for dx in -4..=4 {
+                        let o = (((cy + dy).rem_euclid(h) * w + (cx + dx).rem_euclid(w)) * 4) as usize;
+                        (0..3).for_each(|k| acc[k] += u32::from(img.rgba[o + k]));
+                    }
+                }
+                [(acc[0] / 81) as u8, (acc[1] / 81) as u8, (acc[2] / 81) as u8, 255]
+            };
+            // vehicle::Library mirrors Z (right-handed glTF); the placements are Dagor's: mirror it back
+            let base = m.pos.len() as u32;
+            m.pos.extend(part.positions.iter().map(|p| [p[0], p[1], -p[2]]));
+            m.nrm.extend((0..part.positions.len()).map(|i| part.normals.get(i).map_or([0.0, 1.0, 0.0], |n| [n[0], n[1], -n[2]])));
+            m.rgba.extend((0..part.positions.len()).map(|i| sample(part.uvs.get(i).copied().unwrap_or_default())));
+            m.idx.extend(part.indices.chunks_exact(3).flat_map(|t| [t[0] + base, t[2] + base, t[1] + base]));
+        }
+        (!m.idx.is_empty()).then_some(m)
     }
 
     fn render_mesh(&mut self, model: &RiModel, mats: &[(String, Option<String>)]) -> Option<Mesh> {
@@ -551,9 +620,23 @@ struct Stats {
     ground: bool,
 }
 
-fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid) -> Result<Stats> {
+fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid, placements: Option<Vec<(u32, String, Tm)>>) -> Result<Stats> {
     let file = vehicle::map(&game.join("levels").join(format!("{level}.bin")))?;
     let lv = Level::parse(&file).with_context(|| format!("parsing {level}"))?;
+    let tagged = placements.is_some();
+    let items: Vec<(u32, String, Tm)> = match placements {
+        Some(p) => p,
+        None => {
+            let mut v = Vec::new();
+            for layer in lv.rendinst_layers()? {
+                for ri in layer.instances()? {
+                    v.push((0, layer.pools[ri.pool].name.clone(), ri.tm));
+                }
+            }
+            v
+        }
+    };
+    let (mut inst_tags, mut tree_tags) = (Vec::new(), Vec::new());
     let (x1, z1) = (g.ox + g.cell * (g.w - 1) as f32, g.oz + g.cell * (g.h - 1) as f32);
     let mut roof = vec![f32::NEG_INFINITY; g.w * g.h];
     let mut veg = vec![f32::NEG_INFINITY; g.w * g.h];
@@ -564,34 +647,37 @@ fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid) -> Resul
     let mut insts: Vec<(u32, Tm)> = Vec::new();
     let mut trees: Vec<(u32, [f32; 4])> = Vec::new();
     let mut st = Stats::default();
-    for layer in lv.rendinst_layers()? {
-        for ri in layer.instances()? {
-            let pool = &layer.pools[ri.pool];
-            let p = ri.tm[3];
-            if p[0] < g.ox - 100.0 || p[0] > x1 + 100.0 || p[2] < g.oz - 100.0 || p[2] > z1 + 100.0 {
+    for (tag, pool_name, tm) in &items {
+        {
+            let ri_tm = *tm;
+            let p = ri_tm[3];
+            if !tagged && (p[0] < g.ox - 100.0 || p[0] > x1 + 100.0 || p[2] < g.oz - 100.0 || p[2] > z1 + 100.0) {
                 continue;
             }
-            if !ctx.kinds.contains_key(&pool.name) {
-                let k = ctx.classify(&pool.name);
-                ctx.kinds.insert(pool.name.clone(), k);
+            if !ctx.kinds.contains_key(pool_name) {
+                let k = ctx.classify(pool_name);
+                ctx.kinds.insert(pool_name.clone(), k);
             }
-            match &ctx.kinds[&pool.name] {
+            match &ctx.kinds[pool_name] {
                 Kind::Skip => {}
                 Kind::Tree(t) => {
                     let t = *t;
-                    let s = (ri.tm[0][0].powi(2) + ri.tm[0][1].powi(2) + ri.tm[0][2].powi(2)).sqrt().max(1e-3);
+                    let s = (ri_tm[0][0].powi(2) + ri_tm[0][1].powi(2) + ri_tm[0][2].powi(2)).sqrt().max(1e-3);
                     let m = &ctx.trees[t];
-                    rasterize_disc(&g, p[0], p[2], m.radius * s, p[1] + m.height * s, &mut veg);
+                    if !tagged {
+                        rasterize_disc(&g, p[0], p[2], m.radius * s, p[1] + m.height * s, &mut veg);
+                    }
                     let id = *tree_id.entry(t).or_insert_with(|| {
                         tree_used.push(t);
                         (tree_used.len() - 1) as u32
                     });
                     trees.push((id, [p[0], p[1], p[2], s]));
+                    tree_tags.push(*tag);
                     st.trees += 1;
                 }
                 Kind::Object { mesh, shot, drawn } => {
-                    if !shot.is_empty() {
-                        let world: Vec<Tri> = shot.iter().map(|t| t.map(|q| apply(&ri.tm, q))).collect();
+                    if !shot.is_empty() && !tagged {
+                        let world: Vec<Tri> = shot.iter().map(|t| t.map(|q| apply(&ri_tm, q))).collect();
                         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
                         for q in world.iter().flatten() {
                             for k in 0..3 {
@@ -611,7 +697,8 @@ fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid) -> Resul
                             used.push(*mesh);
                             (used.len() - 1) as u32
                         });
-                        insts.push((id, ri.tm));
+                        insts.push((id, ri_tm));
+                        inst_tags.push(*tag);
                         st.drawn += 1;
                     }
                 }
@@ -671,7 +758,18 @@ fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid) -> Resul
             b.extend_from_slice(&x.to_le_bytes());
         }
     }
+    if tagged {
+        for tags in [&inst_tags, &tree_tags] {
+            b.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+            for t in tags {
+                b.extend_from_slice(&t.to_le_bytes());
+            }
+        }
+    }
     fs::write(out.with_extension("obj"), b).with_context(|| format!("writing {}", out.display()))?;
+    if tagged {
+        return Ok(st);
+    }
 
     // Ground colours over the heightmap's extent (cells centred on the grid points, as the browser draws them)
     if let Some(gm) = GroundMaterial::load(&lv, &ctx.index)? {
@@ -701,6 +799,113 @@ fn export(ctx: &mut Ctx, game: &Path, level: &str, out: &Path, g: Grid) -> Resul
     Ok(st)
 }
 
+/// A ground slab (see the header), LOD 0 in the model's frame (Dagor axes, like the placements): a DynModel
+/// (^^ decals) read straight with its dynModelDesc entry, as some have no skeleton, which vehicle::Library needs
+/// (their parts all sit at the model origin); else a RendInst (an airfield's runway surface mesh).
+fn export_slab(ctx: &mut Ctx, name: &str, out: &Path) -> Result<usize> {
+    // (colour texture, blend, vertices x y z u v, triangle indices) per part
+    let mut parts: Vec<(String, u32, Vec<[f32; 5]>, Vec<u32>)> = Vec::new();
+    let blend = |class: &str| if class.contains("modulate") { None } else if class.contains("decal") || class.contains("overlay") || class.contains("simple") { Some(0) } else { Some(1) };
+    // the part's own vertices, renumbered from 0
+    let mut part = |tex: String, blend: Option<u32>, idx: &[u32], base: usize, vertex: &dyn Fn(usize) -> [f32; 5]| {
+        // grime: modulating decals and asphalt cracks (noise at the app's 0.5 to 2 m)
+        let Some(blend) = blend.filter(|_| !tex.contains("crack")) else { return };
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let (mut verts, mut tris) = (Vec::new(), Vec::with_capacity(idx.len()));
+        for &i in idx {
+            let src = i + base as u32;
+            let n = remap.len() as u32;
+            tris.push(*remap.entry(src).or_insert_with(|| {
+                verts.push(vertex(src as usize));
+                n
+            }));
+        }
+        parts.push((tex, blend, verts, tris));
+    };
+    if let Some(path) = ctx.index.find(class_id::DYN_MODEL, name).map(Path::to_path_buf) {
+        use wt_formats::dynmodel::DynModel;
+        let file = vehicle::map(&path)?;
+        let grp = GrpPack::parse(&file)?;
+        let model = DynModel::parse(grp.data(grp.find(name, class_id::DYN_MODEL).context("not in its pack")?))?;
+        let lod = model.lods.first().context("no LOD")?;
+        if ctx.dyn_descs.is_none() {
+            let mut descs = HashMap::new();
+            for rel in ["patch/content/base/res/dynModelDesc.bin", "content/base/res/dynModelDesc.bin"] {
+                let Ok(raw) = fs::read(ctx.game.join(rel)) else { continue };
+                for b in wt_unpack::blk::parse(&raw, None).with_context(|| format!("parsing {rel}"))?.blocks {
+                    descs.entry(b.name.clone()).or_insert(b);
+                }
+            }
+            ctx.dyn_descs = Some(descs);
+        }
+        let desc = ctx.dyn_descs.as_ref().and_then(|d| d.get(name)).with_context(|| format!("{name}: not in dynModelDesc.bin"))?;
+        let child = |n: &str| desc.blocks.iter().find(|b| b.name == n);
+        let tex_names: Vec<&str> = child("tex").map(|b| b.params.iter().filter_map(|(_, v)| if let Value::Str(s) = v { Some(s.trim_end_matches('*')) } else { None }).collect()).unwrap_or_default();
+        // colour texture (t0) and shader class of each rigid material
+        let colour: Vec<(Option<&str>, &str)> = child("matR")
+            .map(|l| {
+                l.blocks
+                    .iter()
+                    .map(|m| (m.params.iter().find(|(n, _)| n == "t0").and_then(|(_, v)| if let Value::Int(i) = v { tex_names.get(*i as usize).copied() } else { None }), str_param(m, "cls").unwrap_or("")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for e in lod.rigids.iter().flat_map(|r| &r.elems) {
+            let Some(&(Some(tex), class)) = colour.get(e.material) else { continue };
+            let vd = &model.vdata[e.vdata];
+            // elements are checked by DynModel::parse
+            let vertex = |i: usize| { let v = model.vertex(vd, i).unwrap_or_default(); [v.pos[0], v.pos[1], v.pos[2], v.uv[0], v.uv[1]] };
+            part(tex.to_string(), blend(class), &vd.indices[e.first_index..e.first_index + e.triangles * 3], e.base_vertex, &vertex);
+        }
+    } else {
+        let model = resource(&ctx.index, REND_INST, name)?.with_context(|| format!("{name}: no such DynModel or RendInst"))?;
+        let model = RiModel::parse(&model)?;
+        let mats = materials(ctx.descs.get(name));
+        for e in &model.lods.first().context("no LOD")?.elems {
+            let Some((class, Some(tex))) = mats.get(e.material) else { continue };
+            if class.contains("baked_impostor") || is_facing_leaves(class) {
+                continue;
+            }
+            let vd = &model.vdata[e.vdata];
+            let Some(idx) = vd.indices.get(e.first_index..e.first_index + e.triangles * 3) else { continue };
+            let vertex = |i: usize| model.vertex(vd, i).map_or([0.0; 5], |v| [v.pos[0], v.pos[1], v.pos[2], v.uv[0], v.uv[1]]);
+            part(tex.clone(), blend(class), idx, e.base_vertex, &vertex);
+        }
+    }
+    let put = |b: &mut Vec<u8>, x: u32| b.extend_from_slice(&x.to_le_bytes());
+    let (mut b, mut n, mut keys) = (Vec::new(), 0u32, Vec::<String>::new());
+    for (tex, blend, verts, tris) in parts {
+        // the landmesh_alpha parts only fade the slab's edge into the ground around it
+        if tex.contains("landmesh_alpha") {
+            continue;
+        }
+        let t = match keys.iter().position(|k| *k == tex) {
+            Some(t) => t,
+            None => {
+                // tiny ones are placeholders of layered shaders (a 16 px plastic under a whole airfield)
+                let Some(img) = ctx.textures.decode(&tex, 4096)?.filter(|i| i.width > 64 && i.height > 64) else { continue };
+                let mut raw = Vec::with_capacity(8 + img.rgba.len());
+                put(&mut raw, img.width);
+                put(&mut raw, img.height);
+                raw.extend_from_slice(&img.rgba);
+                fs::write(out.with_extension(format!("{}.rgba", keys.len())), raw)?;
+                keys.push(tex);
+                keys.len() - 1
+            }
+        };
+        put(&mut b, t as u32);
+        put(&mut b, blend);
+        put(&mut b, verts.len() as u32);
+        verts.iter().flatten().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+        put(&mut b, tris.len() as u32);
+        tris.iter().for_each(|&i| put(&mut b, i));
+        n += 1;
+    }
+    anyhow::ensure!(n > 0, "{name}: no textured parts");
+    fs::write(out.with_extension("slab"), [n.to_le_bytes().as_slice(), &b].concat())?;
+    Ok(n as usize)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
@@ -709,20 +914,41 @@ fn main() -> Result<()> {
     let game = PathBuf::from(&args[1]);
     let jobs = fs::read_to_string(&args[2])?;
     let mut ctx = Ctx {
-        index: ResourceIndex::build(&game, &[COLLISION, REND_INST, LAND_CLASS])?,
+        index: ResourceIndex::build(&game, &[COLLISION, REND_INST, LAND_CLASS, class_id::DYN_MODEL])?,
         textures: TextureLibrary::open(&game)?,
         descs: model_descs(&game)?,
         tex_colour: HashMap::new(),
         kinds: HashMap::new(),
         meshes: Vec::new(),
         trees: Vec::new(),
+        game: game.clone(),
+        lib: None,
+        dyn_descs: None,
     };
     eprintln!("resources: {}, model descriptions: {}", ctx.index.len(), ctx.descs.len());
     let mut failed = 0;
     for line in jobs.lines().filter(|l| !l.trim().is_empty()) {
         let f: Vec<&str> = line.split_whitespace().collect();
-        let parsed = (|| -> Result<Grid> { Ok(Grid { ox: f[2].parse()?, oz: f[3].parse()?, cell: f[4].parse()?, w: f[5].parse()?, h: f[6].parse()? }) })();
-        match parsed.and_then(|g| export(&mut ctx, &game, f[0], Path::new(f[1]), g)) {
+        if f[0] == "slab" {
+            match export_slab(&mut ctx, f[1], Path::new(f[2])) {
+                Ok(n) => println!("slab {} parts {n}", f[1]),
+                Err(e) => println!("slab {} FAILED {e:#}", f[1]), // the group keeps its plain runway strip
+            }
+            continue;
+        }
+        let parsed = (|| -> Result<(Grid, Option<Vec<(u32, String, Tm)>>)> {
+            let g = Grid { ox: f[2].parse()?, oz: f[3].parse()?, cell: f[4].parse()?, w: f[5].parse()?, h: f[6].parse()? };
+            let Some(pf) = f.get(7) else { return Ok((g, None)) };
+            let mut list = Vec::new();
+            for l in fs::read_to_string(pf)?.lines().filter(|l| !l.trim().is_empty()) {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                anyhow::ensure!(w.len() == 14, "placement line needs 14 fields: {l}");
+                let v: Vec<f32> = w[2..].iter().map(|x| x.parse()).collect::<Result<_, _>>()?;
+                list.push((w[0].parse()?, w[1].to_string(), [[v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]], [v[9], v[10], v[11]]]));
+            }
+            Ok((Grid { w: 0, h: 0, ..g }, Some(list)))
+        })();
+        match parsed.and_then(|(g, pl)| export(&mut ctx, &game, f[0], Path::new(f[1]), g, pl)) {
             Ok(s) => println!("{} block shots {} drawn {} trees {} ground {}", f[0], s.shot, s.drawn, s.trees, if s.ground { "yes" } else { "no" }),
             Err(e) => {
                 failed += 1;

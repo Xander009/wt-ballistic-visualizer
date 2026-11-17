@@ -91,6 +91,12 @@ pub enum Sw {
     VegShots,
     Arc,
     Clip,
+    /// Max build: where aircraft and helicopters spawn
+    Air,
+    /// where shells can land (the gun's dispersion)
+    Spread,
+    /// the gun's fire-control modules are researched (narrower spread)
+    Researched,
 }
 
 pub struct Switches(std::collections::HashSet<Sw>);
@@ -113,6 +119,46 @@ struct Drag {
     pan: bool,
     moved: bool,
     view: (f64, f64),
+}
+
+/// Spawn spots of helicopters (heli pads) and aircraft (airfields), Max build
+pub const COL_HELI: u32 = 0x5ce1e6;
+pub const COL_PLANE: u32 = 0xc58cff;
+
+pub const COL_AA: u32 = 0xff5a4a;
+/// The highest rank a battle has (BR 17.7)
+const RANK_TOP: u32 = 50;
+
+/// A rank span as battle ratings: the game's rank r is BR 1.0 + r / 3
+fn br_span(r: [u32; 2]) -> String {
+    let br = |r: u32| format!("{:.1}", 1.0 + f64::from(r) / 3.0);
+    if r[1] >= RANK_TOP { format!("BR {}+", br(r[0])) } else if r[0] == r[1] { format!("BR {}", br(r[0])) } else { format!("BR {}–{}", br(r[0]), br(r[1])) }
+}
+
+/// "ussr_37mm_61k_airfield" -> "37mm 61k": the gun, without its country and placement tags; "" (an airfield AA slot
+/// the mission puts no gun in) -> "spare AA slot"
+pub fn aa_label(class: &str) -> String {
+    if class.is_empty() {
+        return "spare AA slot".into();
+    }
+    let rest = class.split_once('_').map_or(class, |(_, r)| r);
+    rest.split('_').filter(|w| !matches!(*w, "airfield" | "noground" | "helipad" | "longrange")).collect::<Vec<_>>().join(" ")
+}
+
+/// "t1_air_spawn_arcade" at 1000 m -> "T1 air spawn arcade, 1000 m"
+pub fn air_spawn_label(a: &data::Area) -> String {
+    let rest = a.name.get(3..).unwrap_or(&a.name).replace('_', " ");
+    format!("T{} {rest}, {:.0} m", a.team.unwrap_or(0), a.tm[3][1])
+}
+
+/// The selected mission's object groups (Max build): its objects, and the placements it uses (patches, spawns).
+pub struct GroupsCur {
+    pub mission: usize,
+    pub rank: u32,
+    pub obj: Arc<data::Objects>,
+    pub tags: std::collections::HashSet<u32>,
+    /// the map's patches it places, with their 2D images
+    pub patches: Vec<(Arc<data::Patch>, Layer)>,
 }
 
 /// Images of the current map for both views (RGBA for the 3D textures, GPUI images for 2D).
@@ -148,10 +194,17 @@ pub struct Viewer {
     pub map: Option<Arc<LoadedMap>>,
     map_gen: u64,
     pub map_img: Option<Layer>,
+    /// Max build: the whole level's map image (2D, and the 3D far terrain's colours)
+    pub far_img: Option<Layer>,
+    pub far_water: Option<Layer>,
+    /// Max build: what the selected mission places, built from map.groups
+    pub groups_cur: Option<GroupsCur>,
     pub water: Option<Layer>,
     pub zones_img: Option<(String, Layer, f64)>,
     pub overlay: Option<(Overlay, Layer)>,
     pub mission: usize,
+    /// the battle rank picked for rank-dependent mission content (see rank_spans)
+    pub rank: u32,
     pub mode: GameMode,
     pub view_mode: ViewMode,
     pub detail: usize,
@@ -223,12 +276,12 @@ impl Viewer {
                 }
             }).detach();
         }
-        let sw = Switches([Sw::Border, Sw::Red, Sw::Caps, Sw::Water, Sw::Grid, Sw::Build, Sw::Trees, Sw::Tanks, Sw::GroundDetail, Sw::VegSight, Sw::Arc, Sw::Clip].into_iter().collect());
+        let sw = Switches([Sw::Border, Sw::Red, Sw::Caps, Sw::Water, Sw::Grid, Sw::Build, Sw::Trees, Sw::Tanks, Sw::GroundDetail, Sw::VegSight, Sw::Arc, Sw::Clip, Sw::Air, Sw::Spread, Sw::Researched].into_iter().collect());
         let mut this = Self {
             store, index, focus: cx.focus_handle(), map_sel, tank_sel, mission_sel, mode_sel, view_sel, shell_sel, detail_sel, perf_sel,
             pmin, pmax, range, gun_h, tgt_h, sw,
-            map: None, map_gen: 0, map_img: None, water: None, zones_img: None, overlay: None,
-            mission: 0, mode: GameMode::Realistic, view_mode: ViewMode::Map2D, detail: 2, perf: Perf::Balanced,
+            map: None, map_gen: 0, map_img: None, far_img: None, far_water: None, groups_cur: None, water: None, zones_img: None, overlay: None,
+            mission: 0, rank: RANK_TOP, mode: GameMode::Realistic, view_mode: ViewMode::Map2D, detail: 2, perf: Perf::Balanced,
             tank: tank_i, gun_shell: (0, 0), a: None, b: None, heading: None, hidden_red: Default::default(), red_open: false, drive_keys: Default::default(), driving: false, aim: None, high: None,
             view: View2D { cx: 0.0, cz: 0.0, s: 0.25 }, map_bounds: Bounds::default(), drag: None, hud: String::new(),
             status: (String::new(), false), sweeping: None, pending_missions: None, pending_view: None, center_pending: false, tanks: Default::default(), v3: View3D::default(),
@@ -256,17 +309,49 @@ impl Viewer {
 
     fn params(&self, cx: &App) -> Params {
         let f = |e: &Entity<InputState>, d: f64| e.read(cx).value().trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(d);
-        Params { p_min: f(&self.pmin, -10.0), p_max: f(&self.pmax, 20.0), range: f(&self.range, 2500.0).max(100.0), gun_h: f(&self.gun_h, 2.0), tgt_h: f(&self.tgt_h, 1.5) }
+        // the gun's dispersion, wider while its fire-control modules are not researched
+        let tank = self.index.tanks.get(self.tank);
+        let spread = tank.and_then(|t| t.guns.get(self.gun_shell.0)?.disp).filter(|_| self.sw.on(Sw::Spread)).map(|[h, v]| {
+            let k = tank.and_then(|t| t.stock).filter(|_| !self.sw.on(Sw::Researched)).unwrap_or([1.0, 1.0]);
+            [h * k[0], v * k[1]]
+        });
+        Params { p_min: f(&self.pmin, -10.0), p_max: f(&self.pmax, 20.0), range: f(&self.range, 2500.0).max(100.0), gun_h: f(&self.gun_h, 2.0), tgt_h: f(&self.tgt_h, 1.5), spread }
     }
 
     /// The mission's areas for the game mode, without the red zones switched off in the list.
+    /// A's hull heading: driven, else as spawned on (see place_a), else facing B, else north. None = no A.
+    pub fn hull_heading(&self) -> Option<f64> {
+        let a = self.a?;
+        Some(self.heading.unwrap_or_else(|| self.b.map_or(0.0, |b| (b.x - a.x).atan2(b.z - a.z))))
+    }
     pub fn areas(&self) -> Vec<data::Area> {
         let mut a = self.all_areas();
         a.retain(|a| !(a.kind == "kill" && self.hidden_red.contains(&a.name)));
         a
     }
     fn all_areas(&self) -> Vec<data::Area> {
-        self.map.as_ref().and_then(|m| m.meta.missions.get(self.mission)).map(|m| scene::mission_areas(m, self.mode)).unwrap_or_default()
+        let mut a = self.map.as_ref().and_then(|m| m.meta.missions.get(self.mission)).map(|m| scene::mission_areas(m, self.mode)).unwrap_or_default();
+        a.retain(|a| self.in_rank(a.rank));
+        a
+    }
+    /// In the battles of the picked rank (rank: None = all).
+    pub fn in_rank(&self, rank: Option<[u32; 2]>) -> bool {
+        rank.is_none_or(|[lo, hi]| lo <= self.rank && self.rank <= hi)
+    }
+    /// The rank spans of the selected mission whose content differs (its airfields, heli pads, AA guns and air
+    /// spawns come with rankRange imports): one choice each, none when the mission is the same at every rank.
+    pub fn rank_spans(&self) -> Vec<[u32; 2]> {
+        // Max build only: what the rank changes lies outside the tank map
+        let Some(m) = self.map.as_ref().filter(|m| m.far.is_some()).and_then(|m| m.meta.missions.get(self.mission)) else { return vec![] };
+        let mut ranges: Vec<[u32; 2]> = m.areas.iter().filter_map(|a| a.rank).chain(m.aa.iter().map(|a| [a.4, a.5])).collect();
+        if let Some(g) = self.map.as_ref().and_then(|map| map.groups.as_ref()) {
+            ranges.extend(g.missions.get(&m.name).into_iter().flatten().map(|t| [t.1, t.2]));
+        }
+        let mut cuts: Vec<u32> = ranges.iter().flat_map(|r| [r[0], r[1] + 1]).filter(|&c| c <= RANK_TOP).chain([0, RANK_TOP + 1]).collect();
+        cuts.sort();
+        cuts.dedup();
+        let spans: Vec<[u32; 2]> = cuts.windows(2).map(|w| [w[0], w[1] - 1]).collect();
+        if spans.len() > 1 { spans } else { vec![] }
     }
     fn set_red(&mut self, names: impl IntoIterator<Item = String>, on: bool, cx: &mut Context<Self>) {
         for n in names {
@@ -289,13 +374,25 @@ impl Viewer {
     fn high_key(&self) -> String {
         let mut off: Vec<&str> = self.hidden_red.iter().map(String::as_str).collect();
         off.sort();
-        format!("{}|{}|{:?}|{}", self.map.as_ref().map_or("", |m| m.meta.name.as_str()), self.mission, self.mode, off.join(","))
+        format!("{}|{}|{}|{:?}|{}", self.map.as_ref().map_or("", |m| m.meta.name.as_str()), self.mission, self.rank, self.mode, off.join(","))
     }
     pub fn map_bounds(&self) -> Bounds<Pixels> {
         self.map_bounds
     }
     pub fn sw_bits(&self) -> u32 {
         self.sw.0.iter().map(|s| 1u32 << (*s as u32)).sum()
+    }
+    /// Builds groups_cur for the selected mission when it is out of date (Max build).
+    pub fn sync_groups(&mut self) {
+        let Some(map) = self.map.clone() else { return };
+        let Some(g) = map.groups.clone() else { return };
+        if self.groups_cur.as_ref().is_some_and(|c| c.mission == self.mission && c.rank == self.rank) {
+            return;
+        }
+        let name = map.meta.missions.get(self.mission).map(|m| m.name.as_str()).unwrap_or_default();
+        let tags: std::collections::HashSet<u32> = g.missions.get(name).into_iter().flatten().filter(|t| self.in_rank(Some([t.1, t.2]))).map(|t| t.0).collect();
+        let patches = map.patches.iter().filter(|p| tags.contains(&p.tag)).map(|p| (p.clone(), Layer::new(p.img.clone()))).collect();
+        self.groups_cur = Some(GroupsCur { mission: self.mission, rank: self.rank, obj: Arc::new(g.obj.subset(|t| tags.contains(&t))), tags, patches });
     }
     /// 3D aim view with A and B placed: the camera sits at A.
     pub fn aim_ready(&self) -> bool {
@@ -337,7 +434,7 @@ impl Viewer {
                     return;
                 }
             };
-            if !entry.objects && !entry.ground {
+            if !entry.objects && !entry.ground && entry.far.is_none() {
                 return;
             }
             this.update(cx, |this, cx| { this.set_status(format!("Loading objects, trees and ground colours of {}…", map_title(&entry.name)), false); cx.notify(); }).ok();
@@ -356,14 +453,42 @@ impl Viewer {
                         Err(e) => notes.push(format!("Ground colours failed: {e:#}")),
                     }
                 }
+                let (mut far_img, mut far_water) = (None, None);
+                if let Some(f) = &entry.far {
+                    match data::load_far(&dir, &entry.name, f) {
+                        Ok((fm, groups)) => {
+                            far_img = Some(raster::compose(&fm));
+                            far_water = fm.meta.water.map(|lvl| raster::water(&fm.t, lvl));
+                            // the ground of every airfield and heli pad the missions place (A and B can stand there)
+                            let mut patches = vec![];
+                            if let Some(g) = &groups {
+                                let mut models: std::collections::HashMap<&str, Option<data::Slab>> = Default::default();
+                                for pl in &g.slabs {
+                                    models.entry(&pl.model).or_insert_with(|| data::load_slab(&dir, &pl.model).map_err(|e| notes.push(format!("Airfield ground {}: {e:#}", pl.model))).ok());
+                                }
+                                let slabs: Vec<_> = g.slabs.iter().filter_map(|pl| Some((models[pl.model.as_str()].as_ref()?, pl))).collect();
+                                for &(_, pl) in &slabs {
+                                    match pl.tile.heights(&dir) {
+                                        Ok(tile) => patches.push(raster::patch(&slabs, pl, &tile, &fm)),
+                                        Err(e) => notes.push(format!("Airfield ground {}: {e:#}", pl.model)),
+                                    }
+                                }
+                            }
+                            m.set_far(fm, patches);
+                            m.groups = groups.map(|mut g| { g.settle(&m.t); Arc::new(g) });
+                            m.set_group_roofs();
+                        }
+                        Err(e) => notes.push(format!("Whole level failed: {e:#}")),
+                    }
+                }
                 let img = raster::compose(&m);
-                (m, img, notes)
+                (m, img, far_img, far_water, notes)
             }).await;
             this.update(cx, |this, cx| {
                 if this.map_gen != gen_ {
                     return;
                 }
-                let (m, img, notes) = full;
+                let (m, img, far_img, far_water, notes) = full;
                 let msg = match (&m.obj, notes.first()) {
                     (_, Some(n)) => (n.clone(), true),
                     (Some(o), None) => (format!("{} objects, {} trees and bushes", o.inst.len(), o.trees.len()), false),
@@ -371,6 +496,9 @@ impl Viewer {
                 };
                 this.map = Some(Arc::new(m));
                 this.map_img = Some(Layer::new(img));
+                this.far_img = far_img.map(Layer::new);
+                this.far_water = far_water.map(Layer::new);
+                this.groups_cur = None;
                 this.status = msg;
                 this.v3.map_changed();
                 if let Ok(mode) = std::env::var("WTV_DEMO") {
@@ -399,6 +527,9 @@ impl Viewer {
         self.map = Some(map);
         self.map_img = Some(Layer::new(img));
         self.zones_img = None;
+        self.far_img = None;
+        self.far_water = None;
+        self.groups_cur = None;
         self.a = None;
         self.b = None;
         self.heading = None;
@@ -416,22 +547,50 @@ impl Viewer {
         true
     }
 
-    /// WTV_DEMO=2d|orbit|orbitA|orbitB|aim|sight (WTV_SWEEP=reach|hit|view): A and B 1.2 km apart across a capture zone, highest point found (for screenshots).
+    /// WTV_DEMO=2d|orbit|orbitA|orbitB|aim|sight|level|level2d (WTV_SWEEP=reach|hit|view): A and B 1.2 km apart across a capture zone, highest point found (for screenshots).
     fn demo(&mut self, mode: &str) {
         let Some(map) = self.map.clone() else { return };
         let areas = self.areas();
         let (cx_, cz) = areas.iter().find(|a| a.kind == "capture").map_or(((map.t.ox + map.t.x1) / 2.0, (map.t.oz + map.t.z1) / 2.0), |a| (a.tm[3][0], a.tm[3][2]));
         self.a = Some(Pt { x: cx_ - 600.0, z: cz - 200.0 });
         self.b = Some(Pt { x: cx_ + 600.0, z: cz + 200.0 });
+        // WTV_A / WTV_B = "x,z": the points instead (screenshots)
+        let at = |k: &str| std::env::var(k).ok().and_then(|s| { let (x, z) = s.split_once(',')?; Some(Pt { x: x.trim().parse().ok()?, z: z.trim().parse().ok()? }) });
+        (self.a, self.b) = (at("WTV_A").or(self.a), at("WTV_B").or(self.b));
+        if let Some(a) = self.a {
+            self.place_a(a);
+        }
         if let Some((x, z, h)) = scene::highest_point(&map, &self.zones()) {
             self.high = Some((self.high_key(), x, z, h));
         }
-        self.view_mode = match mode { "2d" => ViewMode::Map2D, "aim" => ViewMode::Aim, "sight" => ViewMode::Sight, _ => ViewMode::Orbit };
+        self.view_mode = match mode { "2d" | "level2d" | "pad2d" => ViewMode::Map2D, "aim" => ViewMode::Aim, "sight" => ViewMode::Sight, _ => ViewMode::Orbit };
         self.pending_view = Some(self.view_mode as usize);
+        self.sync_groups();
+        let k: usize = std::env::var("WTV_PAD").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if let (Some(p), true) = (self.groups_cur.as_ref().and_then(|g| g.patches.get(k)).map(|(p, _)| p.t.clone()), mode.starts_with("pad")) {
+            // B on the mission's k-th airfield or heli pad (WTV_PAD=k), the view on it
+            let (px_, pz, size) = ((p.ox + p.x1) / 2.0, (p.oz + p.z1) / 2.0, (p.x1 - p.ox).max(p.z1 - p.oz));
+            self.b = Some(Pt { x: px_, z: pz });
+            self.v3.fit(&map.t, px_, pz, size);
+            (self.view.cx, self.view.cz, self.view.s) = (px_, pz, std::env::var("WTV_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(900.0 / size));
+            if std::env::var("WTV_SCALE").is_ok() {
+                self.v3.fit(&map.t, px_, pz, 60.0);
+            }
+            return;
+        }
+        if let (Some(f), true) = (&map.far, mode.starts_with("level")) {
+            // the whole level (Max build), 24 km across around the tank map
+            self.v3.fit(&f.t, cx_, cz, 24000.0);
+            (self.view.cx, self.view.cz, self.view.s) = (cx_, cz, 0.04);
+            return;
+        }
         match mode {
             "orbitA" => self.v3.fit(&map.t, cx_ - 600.0, cz - 200.0, 22.0),
             "orbitB" => self.v3.fit(&map.t, cx_ + 600.0, cz + 200.0, 22.0),
             _ => self.v3.fit(&map.t, cx_, cz, 1800.0),
+        }
+        if let (Some(s), Some(b)) = (std::env::var("WTV_SCALE").ok().and_then(|s| s.parse().ok()), self.b) {
+            (self.view.cx, self.view.cz, self.view.s) = (b.x, b.z, s); // close up on B (screenshots)
         }
     }
 
@@ -685,7 +844,7 @@ impl Viewer {
             let pan = d.pan;
             let aim_ready = self.aim_ready();
             if let (Some(map), false) = (self.map.clone(), aim_ready) {
-                self.v3.drag(&map.t, sx, sy, pan, f32::from(self.map_bounds.size.height));
+                self.v3.drag(map.far.as_ref().map_or(&map.t, |f| &f.t), sx, sy, pan, f32::from(self.map_bounds.size.height));
             }
         }
         cx.notify();
@@ -697,18 +856,23 @@ impl Viewer {
             return;
         }
         let Some(p) = self.world_at(ev.position) else { return };
-        if !self.map.as_ref().is_some_and(|m| m.t.inside(p.x, p.z)) {
+        if !self.map.as_ref().is_some_and(|m| m.t.reaches(p.x, p.z)) {
             return;
         }
         match d.btn {
             MouseButton::Left => {
-                self.a = Some(p);
-                self.heading = None; // a newly placed tank faces B
+                self.place_a(p);
             }
             MouseButton::Right => self.b = Some(p),
             _ => return,
         }
         self.update_aim(cx);
+    }
+
+    /// Puts A's tank at `p`: in a spawn zone it faces the way the game spawns it, anywhere else it faces B.
+    fn place_a(&mut self, p: Pt) {
+        self.a = Some(p);
+        self.heading = self.areas().iter().find(|a| a.kind == "spawn" && scene::in_shape(&scene::area_shape(a), p.x, p.z)).map(scene::spawn_heading);
     }
 
     fn wheel(&mut self, ev: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -758,11 +922,11 @@ impl Viewer {
             return false;
         }
         let on = |k: &str| f64::from(u8::from(self.drive_keys.contains(k)));
-        let mut hd = self.heading.unwrap_or_else(|| self.b.map_or(0.0, |b| (b.x - a.x).atan2(b.z - a.z)));
+        let mut hd = self.hull_heading().unwrap_or_default();
         hd += (on("d") - on("a")) * TURN * dt;
         let speed = on("w") * FORWARD - on("s") * REVERSE;
         let (x, z) = (a.x + hd.sin() * speed * dt, a.z + hd.cos() * speed * dt);
-        if map.t.inside(x, z) {
+        if map.t.reaches(x, z) {
             self.a = Some(Pt { x, z });
         }
         self.heading = Some(hd);
@@ -917,6 +1081,17 @@ impl Viewer {
                 .child(field("Level", Select::new(&self.map_sel).search_placeholder("Search levels…")))
                 .child(div().flex().gap_2().child(field("View", Select::new(&self.view_sel))).child(field("Game mode", Select::new(&self.mode_sel))))
                 .child(field("Mission (zones differ per mission and mode)", Select::new(&self.mission_sel)))
+                .when(!self.rank_spans().is_empty(), |d| {
+                    // what the battle's rank changes: which airfields, heli pads and AA guns it has
+                    d.child(field("Battle rating (airfields, heli pads, AA)", div().flex().flex_wrap().gap_1().children(self.rank_spans().into_iter().enumerate().map(|(i, r)| {
+                        let on = r[0] <= self.rank && self.rank <= r[1];
+                        Button::new(("rank", i)).label(br_span(r)).small().when(on, |b| b.primary()).on_click(cx.listener(move |this, _, _, cx| {
+                            this.rank = r[1].min(RANK_TOP);
+                            this.v3.dirty();
+                            cx.notify();
+                        }))
+                    }))))
+                })
                 .child(div().flex().items_center().gap_2().child(Button::new("high").label("Find highest point").small().on_click(cx.listener(|this, _, _, cx| this.find_high(cx))))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(high_txt))))
             .child(card("Layers")
@@ -924,6 +1099,7 @@ impl Viewer {
                 .child(self.switch("sw-red", Sw::Red, "Red zones", Some("Placed kill areas (countdown inside)"), Some(0x8c0000), cx))
                 .child(self.red_list(cx))
                 .child(self.switch("sw-caps", Sw::Caps, "Capture zones and spawns", None, Some(0xf2d14b), cx))
+                .when(self.map.as_ref().is_some_and(|m| m.far.is_some()), |d| d.child(self.switch("sw-air", Sw::Air, "Aircraft and helicopter spawns", Some("Heli pads, airfields, their AA guns and the spawns in the air (whole level)"), Some(COL_HELI), cx)))
                 .child(self.switch("sw-water", Sw::Water, "Water", None, Some(0x3c8cc0), cx))
                 .child(self.switch("sw-grid", Sw::Grid, "100 m grid", None, None, cx))
                 .child(self.switch("sw-build", Sw::Build, "Objects in 3D", Some("Buildings always block"), None, cx))
@@ -941,7 +1117,9 @@ impl Viewer {
                 .child(div().flex().flex_col().font_family("Consolas").text_xs().children(aim_lines.into_iter().map(|(s, k)| {
                     div().min_h(px(14.)).text_color(rgb([0xd8dde2, 0x58c472, 0xe2574c][k as usize])).child(s)
                 })))
-                .child(self.switch("sw-arc", Sw::Arc, "Shell arc in 3D", Some("Path, drop curtain, apex and impact"), None, cx)))
+                .child(self.switch("sw-arc", Sw::Arc, "Shell arc in 3D", Some("Path, drop curtain, apex and impact"), None, cx))
+                .child(self.switch("sw-spread", Sw::Spread, "Shell spread", Some("Where shells can land: the gun's dispersion from the game files"), None, cx))
+                .child(self.switch("sw-researched", Sw::Researched, "Fire-control modules researched", Some("Adjustment of Fire, Elevation Mechanism: without them the spread is wider"), None, cx)))
             .child(card("Sweeps")
                 .child(div().flex().gap_2().child(field("3D terrain detail", Select::new(&self.detail_sel))).child(field("Sweep performance", Select::new(&self.perf_sel))))
                 .child(self.switch("sw-clip", Sw::Clip, "Only battle area", Some("Hit target B also skips red zones"), None, cx))
@@ -1015,6 +1193,10 @@ impl Render for Viewer {
             canvas(|_, _, _| (), move |b, _, window, cx| me.update(cx, |this, cx| crate::draw2d::profile(this, b, window, cx))).size_full()
         };
         let legend = self.legend();
+        let pt_btns = matches!(self.view_mode, ViewMode::Map2D | ViewMode::Orbit);
+        let pill = |id: &'static str, label: &'static str| div().id(id).px_3().py_1().rounded_md().text_xs().font_weight(FontWeight::BOLD).cursor_pointer()
+            .bg(color(0x0c0e10, 0.82)).border_1().border_color(rgb(BORDER)).child(label)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()); // a click on the button never places A
         div().size_full().flex().bg(rgb(BG)).text_color(rgb(0xe6e9ec)).track_focus(&self.focus).on_key_down(cx.listener(Self::key)).on_key_up(cx.listener(Self::key_up))
             .child(self.sidebar(cx))
             .child(div().flex_1().h_full().flex().flex_col().min_w_0()
@@ -1028,7 +1210,10 @@ impl Render for Viewer {
                     .child(map_canvas)
                     .when(!self.hud.is_empty(), |d| d.child(glass().top_2().left_2().font_family("Consolas").child(self.hud.clone())))
                     .when(!self.status.0.is_empty(), |d| d.child(glass().top_2().right_2().when(self.status.1, |d| d.text_color(rgb(0xff8a80))).child(self.status.0.clone())))
-                    .child(div().absolute().top_2().w_full().flex().justify_center().child(
+                    .child(div().absolute().top_2().w_full().flex().justify_center().gap_2()
+                        .when(pt_btns && self.a.is_some(), |d| d.child(pill("btn-rm-a", "Remove A").on_click(cx.listener(|this, _, _, cx| { this.a = None; this.heading = None; this.update_aim(cx); }))))
+                        .when(pt_btns && self.b.is_some(), |d| d.child(pill("btn-rm-b", "Remove B").on_click(cx.listener(|this, _, _, cx| { this.b = None; this.update_aim(cx); }))))
+                        .child(
                         div().id("btn-red").px_3().py_1().rounded_md().text_xs().font_weight(FontWeight::BOLD).cursor_pointer()
                             .bg(if border_on { color(0x8c1414, 0.9) } else { color(0x0c0e10, 0.82) }).border_1().border_color(rgb(if border_on { 0xe2574c } else { BORDER }))
                             .child(format!("Map border: {} (R)", if border_on { "ON" } else { "OFF" }))

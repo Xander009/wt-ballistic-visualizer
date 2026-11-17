@@ -2,7 +2,7 @@
 
 use gpui::{App, Bounds, Pixels, Window, point, px};
 
-use crate::app::{COL_A, COL_B, COL_BPT, COL_HIGH, Sw, Viewer};
+use crate::app::{COL_A, COL_AA, COL_B, COL_BPT, COL_HELI, COL_HIGH, COL_PLANE, Sw, Viewer, aa_label, air_spawn_label};
 use crate::core::Key;
 use crate::paint::{self, color, p};
 use crate::scene::{self, Shape};
@@ -17,6 +17,22 @@ pub fn map(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut App)
     // a screen rect for a world extent starting at the map's top-left corner (x0, z top)
     let rect = |v: &Viewer, x0: f64, ztop: f64, wm: f64, hm: f64| Bounds::new(point(px(ox + v.sx(x0)), px(oy + v.sy(ztop))), gpui::size(px((wm * v.view.s) as f32), px((hm * v.view.s) as f32)));
     let ext = (t.w as f64 * c, t.hh as f64 * c);
+    if let (Some(f), Some(l)) = (&m.far, &v.far_img) {
+        let (ft, fc) = (&f.t, f.t.cell); // the whole level under the tank map (Max build), view only
+        let fr = rect(v, ft.ox - fc / 2.0, ft.z1 + fc / 2.0, ft.w as f64 * fc, ft.hh as f64 * fc);
+        paint::image(window, &l.img, fr);
+        v.sync_groups();
+        if let Some(g) = &v.groups_cur {
+            // the ground of the mission's airfields and heli pads, over the whole level's coarser image
+            for (p, l) in &g.patches {
+                let pt = &p.t;
+                paint::image(window, &l.img, rect(v, pt.ox - pt.cell / 2.0, pt.z1 + pt.cell / 2.0, pt.w as f64 * pt.cell, pt.hh as f64 * pt.cell));
+            }
+        }
+        if let (Some(w), true) = (&v.far_water, v.sw.on(Sw::Water)) {
+            paint::image(window, &w.img, fr);
+        }
+    }
     if let Some(l) = &v.map_img {
         paint::image(window, &l.img, rect(v, t.ox - c / 2.0, t.z1 + c / 2.0, ext.0, ext.1));
     }
@@ -48,8 +64,8 @@ pub fn map(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut App)
     }
     if v.sw.on(Sw::Caps) {
         for a in v.areas() {
-            if a.kind == "battle" || a.kind == "kill" {
-                continue; // those two are in the zone layer
+            if a.kind == "battle" || a.kind == "kill" || a.kind == "airspawn" {
+                continue; // the first two are in the zone layer, air spawns below
             }
             let col = color(scene::area_color(&a), 1.0);
             match scene::area_shape(&a) {
@@ -67,6 +83,71 @@ pub fn map(v: &mut Viewer, b: Bounds<Pixels>, window: &mut Window, cx: &mut App)
                     }
                     paint::stroke(window, &pts, 1.5, col, None, true);
                 }
+            }
+            if a.kind == "spawn" {
+                // the way a tank spawned here faces, and (zoomed in) its compass reading
+                let (hd, c) = (scene::spawn_heading(&a), [a.tm[3][0], a.tm[3][2]]);
+                let len = 22.0 / v.view.s;
+                let (p0, p1) = (sp(v, c[0], c[1]), sp(v, c[0] + hd.sin() * len, c[1] + hd.cos() * len));
+                paint::stroke(window, &[p0, p1], 2.0, col, None, false);
+                let side = |s: f64| sp(v, c[0] + (hd + s).sin() * len * 0.7, c[1] + (hd + s).cos() * len * 0.7);
+                paint::stroke(window, &[side(0.25), p1, side(-0.25)], 2.0, col, None, false);
+                if v.view.s > 3.0 {
+                    paint::text(window, cx, &format!("{}°", scene::compass_deg(hd)), point(p1.x + px(3.), p1.y - px(7.)), col, 11.0, true);
+                }
+            }
+        }
+    }
+    if v.sw.on(Sw::Air) {
+        if let (Some(g), Some(groups)) = (&v.groups_cur, &m.groups) {
+            // spawn spots, and a label per heli pad or airfield where its spots are
+            let mut at: std::collections::BTreeMap<(u32, &str), (f64, f64, usize)> = Default::default();
+            for (tag, kind, x, _, z) in groups.spawns.iter().filter(|s| g.tags.contains(&s.0)) {
+                let col = if kind == "heli" { COL_HELI } else { COL_PLANE };
+                paint::dot(window, sp(v, *x, *z), if v.view.s > 0.3 { 4.0 } else { 2.5 }, Some(color(col, 1.0)), Some((color(0, 0.8), 1.0)));
+                let e = at.entry((*tag, kind.as_str())).or_default();
+                (e.0, e.1, e.2) = (e.0 + x, e.1 + z, e.2 + 1);
+            }
+            for ((_, kind), (x, z, n)) in at {
+                let c = sp(v, x / n as f64, z / n as f64);
+                let label = if kind == "heli" { format!("Heli pad: {n} spawns") } else { format!("Airfield: {n} spawns") };
+                paint::text(window, cx, &label, point(c.x + px(8.), c.y + px(6.)), color(if kind == "heli" { COL_HELI } else { COL_PLANE }, 1.0), 11.0, true);
+            }
+        }
+        // anti-aircraft guns: a square each, the gun's name when zoomed in
+        if m.far.is_some() {
+            for (_, class, x, z, _, _) in m.meta.missions.get(v.mission).map_or(&[][..], |ms| &ms.aa[..]).iter().filter(|a| v.in_rank(Some([a.4, a.5]))) {
+                let c = sp(v, *x, *z);
+                let s = px(if v.view.s > 0.3 { 4.0 } else { 2.5 });
+                let sq = [point(c.x - s, c.y - s), point(c.x + s, c.y - s), point(c.x + s, c.y + s), point(c.x - s, c.y + s)];
+                // a spare slot (no gun in this mission): hollow, dimmer
+                let a = if class.is_empty() { 0.55 } else { 1.0 };
+                if !class.is_empty() {
+                    paint::fill(window, &sq, color(COL_AA, 1.0));
+                }
+                paint::stroke(window, &sq, 1.0, if class.is_empty() { color(COL_AA, a) } else { color(0, 0.8) }, None, true);
+                if v.view.s > 0.15 {
+                    paint::text(window, cx, &aa_label(class), point(c.x + px(6.), c.y - px(6.)), color(COL_AA, a), 10.0, true);
+                }
+            }
+        }
+        for a in v.areas().iter().filter(|a| a.kind == "airspawn") {
+            if let Shape::Circle { c, r } = scene::area_shape(a) {
+                let col = color(scene::area_color(a), 1.0);
+                let ctr = sp(v, c[0], c[1]);
+                paint::stroke(window, &paint::circle_pts(ctr, ((r * v.view.s) as f32).max(4.0)), 1.5, col, Some(&[3.0, 3.0]), true);
+                paint::text(window, cx, &air_spawn_label(a), point(ctr.x + px(6.), ctr.y - px(16.)), col, 11.0, true);
+            }
+        }
+    }
+    if let Some(aim) = &v.aim {
+        // where the shells can land
+        for (i, s) in aim.sols.iter().enumerate() {
+            if s.spread.len() > 2 {
+                let col = if i > 0 { COL_B } else { COL_A };
+                let pts: Vec<_> = s.spread.iter().map(|q| sp(v, q[0], q[2])).collect();
+                paint::fill(window, &pts, color(col, 0.25));
+                paint::stroke(window, &pts, 1.5, color(col, 1.0), None, true);
             }
         }
     }

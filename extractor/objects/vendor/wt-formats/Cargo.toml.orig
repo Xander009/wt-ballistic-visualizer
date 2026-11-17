@@ -1,0 +1,36 @@
+[package]
+name = "wt-formats"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.90"
+description = "Readers for the Dagor Engine resource formats of War Thunder: GRP packs, DXP texture packs, DDSx textures, DynModels and skeletons"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/patodois/wt-formats"
+keywords = ["war-thunder", "dagor", "gamedev", "assets", "parser"]
+categories = ["game-development", "parser-implementations"]
+exclude = ["oracle/", "target/"]
+
+[workspace]
+# The oracle (oracle/) compares this crate with the earlier readers of the project on a game install; it is not
+# part of the crate.
+exclude = ["oracle"]
+
+[dependencies]
+# zstd frames (none occurs in the game's files)
+ruzstd = "0.8"
+flate2 = "1"
+# Oodle streams (textures, models), clean-room (github.com/patodois/lztans)
+lztans = "0.1.0"
+# BC1..BC7 block decoders, for `Texture::to_rgba` and `Texture::to_png` (github.com/patodois/bcn-decode)
+bcn-decode = { version = "0.1.0", optional = true }
+png = { version = "0.18.1", optional = true }
+
+[dev-dependencies]
+# to build zstd frames in the tests
+zstd = "0.13"
+
+[features]
+default = []
+# Texture::to_rgba and Texture::to_png
+png = ["dep:bcn-decode", "dep:png"]

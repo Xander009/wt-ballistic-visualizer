@@ -1,6 +1,8 @@
 //! Make the self-contained build: the app with the data appended (see src/store.rs).
-//!   cargo build --release && cargo run --release --bin bundle [-- [<data dir> [<out.exe>]]]
-//! Writes ../dist/WT-Ballistic-Visualizer-Lite.exe. To keep it small:
+//!   cargo build --release && cargo run --release --bin bundle [-- [--max] [<data dir> [<out.exe>]]]
+//! Writes ../dist/WT-Ballistic-Visualizer-Lite.exe, or with --max ../dist/WT-Ballistic-Visualizer-Max.exe: the
+//! same plus each whole level around its tank map (maps/*.far.*, extract.py --far) and the missions' object
+//! groups (maps/*.groups.*: airfields, heli pads) with their ground slabs (slabs/*). Lite leaves those out. To keep both small:
 //! - tank models: only a Leopard 2A4 (shown at A for every tank) and the T-72A at B
 //! - heightmaps, objects and tank models stored raw and packed with xz; heightmaps as residuals of a gradient
 //!   predictor (lossless), object mesh positions as 16-bit values over each model's bounding box (~3 mm on 200 m)
@@ -23,20 +25,31 @@ const LITE_GROUND_PX: u32 = 2048;
 
 fn main() -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--lite").collect(); // --lite: the old flag
+    let max = std::env::args().any(|a| a == "--max");
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--lite" && a != "--max").collect(); // --lite: the old flag
     let data = args.first().map(PathBuf::from).unwrap_or_else(|| root.join("../data"));
-    let out = args.get(1).map(PathBuf::from).unwrap_or_else(|| root.join("../dist/WT-Ballistic-Visualizer-Lite.exe"));
+    let out = args.get(1).map(PathBuf::from).unwrap_or_else(|| root.join(if max { "../dist/WT-Ballistic-Visualizer-Max.exe" } else { "../dist/WT-Ballistic-Visualizer-Lite.exe" }));
     let exe = std::env::current_exe()?.with_file_name("wtv.exe");
     anyhow::ensure!(exe.exists(), "{} not found: run `cargo build --release` first", exe.display());
     anyhow::ensure!(data.join("index.js").exists(), "{} has no index.js: run the extractor first", data.display());
 
     let mut jobs = list(&data)?;
     jobs.retain(|r| r.strip_prefix("tanks/").is_none_or(|m| m == format!("{LITE_A}.js") || m == format!("{LITE_B}.js")));
+    jobs.retain(|r| max || !is_whole_level(r));
+    if max {
+        anyhow::ensure!(jobs.iter().any(|r| is_whole_level(r)), "{} has no whole-level files: run extract.py --far first", data.display());
+    }
     let t0 = std::time::Instant::now();
     let progress = |done: usize, all: usize| eprint!("\rpacking {done}/{all} files");
-    let (n, size) = store::bundle(&exe, &out, &jobs, |r| lite_entries(&data, r), progress)?;
+    let (n, size) = store::bundle(&exe, &out, &jobs, |r| lite_entries(&data, r, max), progress)?;
     eprintln!("\nwrote {} ({n} entries, {:.0} MB) in {:.0} s", out.display(), size as f64 / 1e6, t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// The Max build's files: a whole level around a tank map, the missions' object groups, or the ground slabs of
+/// their airfields and heli pads.
+fn is_whole_level(rel: &str) -> bool {
+    rel.contains(".far.") || rel.contains(".groups.") || rel.starts_with("slabs/")
 }
 
 /// Every .js file under `data`, as paths relative to it with forward slashes.
@@ -83,7 +96,7 @@ fn data_url(v: &Value) -> Result<Vec<u8>> {
 }
 
 /// The lite entries of one data file: the file with its big payloads replaced by "@<entry>", and those entries.
-fn lite_entries(data: &Path, rel: &str) -> Result<Vec<(String, Vec<u8>)>> {
+fn lite_entries(data: &Path, rel: &str, max: bool) -> Result<Vec<(String, Vec<u8>)>> {
     let text = std::fs::read_to_string(data.join(rel))?;
     let base = rel.trim_end_matches(".js");
     let (name, mut a) = parse_call(&text)?;
@@ -92,6 +105,11 @@ fn lite_entries(data: &Path, rel: &str) -> Result<Vec<(String, Vec<u8>)>> {
         "WTV_INDEX" => {
             for t in a[0]["tanks"].as_array_mut().context("index without tanks")? {
                 t["model"] = Value::from(LITE_A); // every tank shows the same model at A
+            }
+            if !max {
+                for m in a[0]["maps"].as_array_mut().context("index without maps")? {
+                    m.as_object_mut().map(|o| o.remove("far")); // Lite has no whole-level files
+                }
             }
         }
         "WTV_MAP" => {
@@ -124,6 +142,7 @@ fn lite_entries(data: &Path, rel: &str) -> Result<Vec<(String, Vec<u8>)>> {
                 }
             }
         }
+        "WTV_SLAB" => {} // a small mesh and its JPEG textures, kept as they are
         other => anyhow::bail!("{rel}: unknown data file {other}"),
     }
     out.push((rel.to_string(), write_call(&name, &a)));

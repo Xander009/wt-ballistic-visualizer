@@ -205,6 +205,8 @@ pub struct Params {
     pub range: f64,
     pub gun_h: f64,
     pub tgt_h: f64,
+    /// the gun's largest deviation from the bore line, horizontal and vertical, degrees; None: no spread shown
+    pub spread: Option<[f64; 2]>,
 }
 
 pub struct Sol {
@@ -214,7 +216,14 @@ pub struct Sol {
     pub v: f64,
     pub blocked: Option<f64>,
     pub by: &'static str,
+    /// where the shot can land: the outline of the impacts of shots leaving the bore at the edge of the spread
+    pub spread: Vec<[f64; 3]>,
+    /// the spread's cross-section at B's distance: where those shots pass B (the end of the cone from the muzzle)
+    pub ring: Vec<[f64; 3]>,
 }
+
+/// Points on the outline of where shots fired at elevation `e` can land (see Params::spread).
+const SPREAD_POINTS: usize = 32;
 pub struct Aim {
     pub d: f64,
     pub dy: f64,
@@ -248,13 +257,37 @@ pub fn compute_aim(map: &LoadedMap, tc: &Terrain, ts: &Terrain, shell: &Shell, a
             .map(|e| {
                 let tr = core::simulate(shell, e, y_a, d + 1.0, Default::default());
                 let blocked = core::path_blocked(tc, a, dir, &tr, d, step);
-                Sol { e, t: tr.at(Key::T, d), v: tr.at(Key::V, d), by: blocked.map_or("", |s| what(tc, a, dir, s)), blocked, tr }
+                // the edge of the spread: SPREAD_POINTS shots leaving the bore at the largest deviation around it
+                let edge: Vec<(f64, f64)> = p.spread.map_or(vec![], |[h, v]| {
+                    (0..SPREAD_POINTS).map(|k| { let th = k as f64 / SPREAD_POINTS as f64 * std::f64::consts::TAU; ((h * th.cos()).to_radians(), (v * th.sin()).to_radians()) }).collect()
+                });
+                let spread = edge.iter().filter_map(|&(dh, dv)| core::impact(tc, shell, a, y_a, dir, e, dh, dv, (d * 3.0).max(d + 2000.0), step)).collect();
+                let ring = edge
+                    .iter()
+                    .map(|&(dh, dv)| {
+                        let y = core::simulate(shell, e + dv, y_a, d + 1.0, Default::default()).at(Key::Y, d);
+                        let (c, s) = (dh.cos(), dh.sin());
+                        [a.x + (dir.0 * c + dir.1 * s) * d, y, a.z + (dir.1 * c - dir.0 * s) * d]
+                    })
+                    .collect();
+                Sol { e, t: tr.at(Key::T, d), v: tr.at(Key::V, d), by: blocked.map_or("", |s| what(tc, a, dir, s)), blocked, tr, spread, ring }
             })
             .collect()
     } else {
         vec![]
     };
     Aim { d, dy, y_a, y_b, g_a, g_b, los, los_by: los.map_or("", |s| what(ts, a, dir, s)), sols, dir }
+}
+
+/// The heading (azimuth: 0 = +Z, north, clockwise to +X, east) a tank spawned in the spawn zone `a` faces: the zone's
+/// local +X axis (it points towards the enemy's spawns in 96 % of the game's tank spawn zones).
+pub fn spawn_heading(a: &Area) -> f64 {
+    a.tm[0][0].atan2(a.tm[0][2])
+}
+
+/// What the game's compass reads for an azimuth (rad): whole degrees, 0 to 359.
+pub fn compass_deg(az: f64) -> i64 {
+    (az.to_degrees().round() as i64).rem_euclid(360)
 }
 
 pub fn mil(r: f64) -> String {
@@ -287,6 +320,9 @@ pub fn aim_lines(aim: &Aim, p: &Params) -> Vec<(String, u8)> {
         out.push((format!("  gun elev   {:.3}°  ({} mil)", q.e / DEG, mil(q.e)), 0));
         out.push((format!("  over LOS   {} mil  = aim {hold:.2} m above B", mil(q.e - los_ang)), 0));
         out.push((format!("  flight     {:.2} s, impact {:.0} m/s", q.t, q.v), 0));
+        if let Some([h, v]) = p.spread {
+            out.push((format!("  spread     ±{:.2} m sideways, ±{:.2} m up/down at B", aim.d * h.to_radians().tan(), aim.d * v.to_radians().tan()), 0));
+        }
     }
     out
 }
@@ -344,7 +380,7 @@ pub fn run_sweep(kind: SweepKind, map: &LoadedMap, t: &Terrain, shell: &Shell, p
     let sp = SweepP { n_az, ds, range: p.range, gun_h: p.gun_h, tgt_h: p.tgt_h, y_pt };
     let tab = (kind != SweepKind::View).then(|| {
         let y_alt = y_pt + if kind == SweepKind::Reach { p.gun_h } else { p.tgt_h };
-        core::build_table(shell, p.p_min, p.p_max, e_step, y_alt, t.lo - 10.0, p.range, ds)
+        core::build_table(shell, p.p_min, p.p_max, e_step, y_alt, t.extent()[4] - 10.0, p.range, ds)
     });
     let n = tab.as_ref().map_or((p.range / ds).ceil() as usize + 1, |t| t.n);
     let chunk = 8;
@@ -398,7 +434,7 @@ pub fn run_sweep(kind: SweepKind, map: &LoadedMap, t: &Terrain, shell: &Shell, p
                 }
                 let v = all[((az / (2.0 * std::f64::consts::PI) * n_az as f64).round() as usize % n_az) * n + i];
                 let (x, z) = (pt.x + dx, pt.z + dz);
-                if (v == 0 && !view) || !map.t.inside(x, z) || (!view && zones.is_some_and(|zs| !zs.valid(x, z))) {
+                if (v == 0 && !view) || !map.t.reaches(x, z) || (!view && zones.is_some_and(|zs| !zs.valid(x, z))) {
                     continue;
                 }
                 if !view && map.tr.src_at(x, z) == 1 {
@@ -422,15 +458,24 @@ mod tests {
     use super::*;
 
     fn area(name: &str, kind: &str, mode: Option<&str>) -> Area {
-        Area { name: name.into(), kind: kind.into(), team: None, shape: "Box".into(), tm: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]], mode: mode.map(Into::into), group: Some(name.split('_').next().unwrap().into()) }
+        Area { name: name.into(), kind: kind.into(), team: None, shape: "Box".into(), tm: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0], [0.0, 0.0, 0.0]], mode: mode.map(Into::into), group: Some(name.split('_').next().unwrap().into()), rank: None }
     }
 
     #[test]
     fn mode_variants_fall_back_like_the_page() {
-        let m = Mission { name: "m".into(), areas: vec![area("kill_a", "kill", None), area("kill_a", "kill", Some("simulator")), area("battle_x", "battle", Some("arcade"))] };
+        let m = Mission { name: "m".into(), areas: vec![area("kill_a", "kill", None), area("kill_a", "kill", Some("simulator")), area("battle_x", "battle", Some("arcade"))], aa: vec![] };
         let names = |md| mission_areas(&m, md).iter().map(|a| a.mode.clone().unwrap_or_default()).collect::<Vec<_>>();
         assert_eq!(names(GameMode::Simulator), ["simulator", "arcade"]);
         assert_eq!(names(GameMode::Realistic), ["", "arcade"]); // realistic falls back to arcade, then ""
+    }
+
+    #[test]
+    fn spawn_heading_is_the_zone_x_axis_on_the_compass() {
+        let mut a = area("t1_spawn", "spawn", None);
+        a.tm[0] = [0.0, 0.0, -10.0]; // +X along -Z: facing south
+        assert_eq!(compass_deg(spawn_heading(&a)), 180);
+        a.tm[0] = [-10.0, 0.0, 0.0]; // along -X: west
+        assert_eq!(compass_deg(spawn_heading(&a)), 270);
     }
 
     #[test]
@@ -468,7 +513,7 @@ mod sweep_tests {
         let areas = mission_areas(map.meta.missions.iter().find(|m| m.name.ends_with("_dom")).unwrap(), GameMode::Realistic);
         let cap = areas.iter().find(|a| a.kind == "capture").unwrap();
         let pt = Pt { x: cap.tm[3][0] - 600.0, z: cap.tm[3][2] - 200.0 };
-        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5 };
+        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5, spread: None };
         let all = run_sweep(SweepKind::Reach, &map, &map.tr, &sh, pt, &p, Perf::Fast, None);
         let z = Zones::of(&areas);
         let clip = run_sweep(SweepKind::Reach, &map, &map.tr, &sh, pt, &p, Perf::Fast, Some(&z));
@@ -494,7 +539,7 @@ mod stand_tests {
         let b = Pt { x: a.x + 300.0, z: a.z };
         let idx = crate::data::load_index(&store).unwrap();
         let sh = &idx.tanks[0].guns[0].shells[0];
-        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5 };
+        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5, spread: None };
         let aim = compute_aim(&map, tr, tr, sh, a, b, &p);
         assert!((aim.g_a - tr.height_at(a.x, a.z)).abs() < 1e-9);
         assert!(aim.g_a > t.height_at(a.x, a.z) + 3.0);
@@ -545,10 +590,40 @@ mod reach_clip_tests {
         let mut battle = full.clone();
         battle.kill.clear();
         let (x, z, _) = highest_point(&map, &full).unwrap();
-        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5 };
+        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5, spread: None };
         let a = run_sweep(SweepKind::Reach, &map, &map.tr, &sh, Pt { x, z }, &p, Perf::Fast, Some(&battle));
         let b = run_sweep(SweepKind::Reach, &map, &map.tr, &sh, Pt { x, z }, &p, Perf::Fast, Some(&full));
         assert!(a.km2 > b.km2 + 0.01, "battle only {} vs without red zones {}", a.km2, b.km2);
     }
 }
 
+
+
+#[cfg(test)]
+mod spread_real {
+    use super::*;
+    /// Review aid: an unblocked 1 km shot on a real map and its spread outline around B.
+    #[test]
+    #[ignore]
+    fn spread_outline_surrounds_b() {
+        let store = crate::data::Store::open();
+        let Ok((meta, h16)) = crate::data::load_map(&store, "avg_abandoned_factory") else { return };
+        let mut map = LoadedMap::new(meta, h16);
+        map.set_objects(crate::data::load_objects(&store, "avg_abandoned_factory").unwrap()).unwrap();
+        let sh = Shell { kind: String::new(), v0: 1640.0, m: 4.3, cal: 0.032, cx: 0.3, name: String::new(), cx_est: false };
+        let p = Params { p_min: -10.0, p_max: 20.0, range: 2500.0, gun_h: 2.0, tgt_h: 1.5, spread: Some([0.03, 0.03]) };
+        for i in 0..400 {
+            let (x, z) = (300.0 + (i % 20) as f64 * 170.0, 300.0 + (i / 20) as f64 * 170.0);
+            let (a, b) = (Pt { x, z }, Pt { x: x + 700.0, z: z + 700.0 });
+            if !map.t.inside(b.x, b.z) { continue }
+            let aim = compute_aim(&map, &map.tr, &map.tr, &sh, a, b, &p);
+            let Some(s) = aim.sols.first().filter(|s| s.blocked.is_none() && aim.los.is_none()) else { continue };
+            let (dx, dz): (Vec<f64>, Vec<f64>) = s.spread.iter().map(|q| (q[0] - b.x, q[2] - b.z)).unzip();
+            let r = |v: &[f64]| (v.iter().cloned().fold(f64::MAX, f64::min), v.iter().cloned().fold(f64::MIN, f64::max));
+            eprintln!("A {x},{z} B {},{}: {} points, dx {:?} dz {:?}", b.x, b.z, s.spread.len(), r(&dx), r(&dz));
+            assert_eq!(s.spread.len(), SPREAD_POINTS);
+            return;
+        }
+        panic!("no clear shot");
+    }
+}

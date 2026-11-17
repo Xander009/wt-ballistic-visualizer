@@ -13,3 +13,7 @@ wt-formats = "0.1.0"
 
 [profile.release]
 opt-level = 3
+
+# wt-formats 0.1.1 with one fix: it reads the slab DynModels of airfields and heli pads (see vendor/wt-formats, "wtv patch")
+[patch.crates-io]
+wt-formats = { path = "vendor/wt-formats" }

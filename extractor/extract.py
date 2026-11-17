@@ -4,7 +4,9 @@
 Reads the installed game with wt-unpack.exe (vromfs, BLK -> JSON, HM2 heightmap -> 16-bit PNG).
 Writes ../data/index.js and ../data/maps/<level>.js (loaded by <script> tags, so file:// works offline).
 
-Usage:  python extract.py [--game "D:\\...\\War Thunder"] [--levels avg_abandoned_factory,avg_berlin]
+Usage:  python extract.py [--game "D:\\...\\War Thunder"] [--levels avg_abandoned_factory,avg_berlin] [--far]
+        --far also writes maps/<level>.far.js (+ .far.obj.js, .far.tex.js): the whole level from its landmesh,
+        for the Max build's view-only terrain around the tank area.
 Needs:  Pillow, numpy.
 """
 import argparse
@@ -12,6 +14,7 @@ import base64
 import csv
 import io
 import json
+import math
 import re
 import shutil
 import struct
@@ -27,6 +30,11 @@ from PIL import Image, ImageOps
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_GAME = r"D:\SteamLibrary\steamapps\common\War Thunder"
 MAX_GRID = 4096  # heightmaps above this are strided down to keep the browser under ~100 MB
+RUNWAY_LIFT = 2.0  # metres a runway or pad surface floats over its group: the 32 m whole-level ground is too coarse to follow it
+SLAB_PX = 2048  # largest side of a slab texture kept (the app draws airfields at about 2 m, heli pads at 0.5 m)
+SLAB_TILE = 8  # metres per landmesh height around airfields and heli pads
+SLAB_MARGIN = 96  # metres of that detail kept around a slab
+FAR_CELL = 32  # metres per grid step of the whole-level (--far) terrain: about 2048 x 2048 on a 65 km level
 
 
 def find_wt_unpack(arg):
@@ -135,7 +143,19 @@ def shells_of_weapon(w):
     return out
 
 
-def extract_tanks(aces, names):
+def stock_spread(char):
+    """Per module name, how much it widens a gun's spread while not researched: (horizontal, vertical) factors
+    (char.vromfs config/modifications: effects of modules with invertEnableLogic, e.g. Adjustment of Fire)."""
+    mods = (load_json(char / "config" / "modifications.blk.json").get("modifications") or {}) if (char / "config" / "modifications.blk.json").exists() else {}
+    out = {}
+    for name, m in mods.items():
+        e = m.get("effects") if isinstance(m, dict) and m.get("invertEnableLogic") in (True, "yes") else None
+        if isinstance(e, dict) and ("mulMaxDeltaAngle" in e or "mulMaxDeltaAngleVertical" in e):
+            out[name] = (float(e.get("mulMaxDeltaAngle", 1.0)), float(e.get("mulMaxDeltaAngleVertical", 1.0)))
+    return out
+
+
+def extract_tanks(aces, names, spread_mods=None):
     tank_dir = aces / "gamedata" / "units" / "tankmodels"
     weapon_cache = {}
     tanks = []
@@ -171,12 +191,27 @@ def extract_tanks(aces, names):
                 pitch = (d.get("limits") or {}).get("pitch") or [-10.0, 20.0]
                 for s in shells:
                     s["name"] = names.get(s["id"].lower(), s["id"])
-                (cannons if w.get("cannon") else others).append({"weapon": Path(p).stem, "pitch": [float(pitch[0]), float(pitch[1])], "shells": shells})
+                gun = {"weapon": Path(p).stem, "pitch": [float(pitch[0]), float(pitch[1])], "shells": shells}
+                h = w.get("maxDeltaAngle")
+                if isinstance(h, (int, float)):
+                    # the largest angle a shot leaves the bore line by, in degrees (all modules researched)
+                    v = w.get("maxDeltaAngleVertical")
+                    gun["disp"] = [float(h), float(v) if isinstance(v, (int, float)) else float(h)]
+                (cannons if w.get("cannon") else others).append(gun)
         # machine-gun-class weapons (autocannons of SPAA, 20 mm light tanks) only for vehicles without a cannon
         guns = cannons or others
         if guns:
             model = t.get("model")
-            tanks.append({"id": tid, "name": title, "model": model.lower() if isinstance(model, str) else None, "guns": guns})
+            rec = {"id": tid, "name": title, "model": model.lower() if isinstance(model, str) else None, "guns": guns}
+            # the spread factors of the modules this tank has, while none is researched
+            stock = [1.0, 1.0]
+            for mod in (t.get("modifications") or {}):
+                f = (spread_mods or {}).get(mod)
+                if f:
+                    stock = [stock[0] * f[0], stock[1] * f[1]]
+            if stock != [1.0, 1.0]:
+                rec["stock"] = [round(stock[0], 4), round(stock[1], 4)]
+            tanks.append(rec)
     estimate_cx(tanks)
     return tanks
 
@@ -211,6 +246,11 @@ def resolve_mission(path, mis_root, depth=0):
                 ip = mis_root / (fp.lower() + ".json")
                 if ip.exists():
                     a, u, sub = resolve_mission(ip, mis_root, depth + 1)
+                    rr = rec.get("rankRange")
+                    if isinstance(rr, list) and len(rr) == 2:
+                        # loaded only for battles of these ranks (low or high rank airfields, heli pads)
+                        a = {k: {**x, "_rank": rank_and(x.get("_rank"), rr)} for k, x in a.items()}
+                        u = [(k, {**x, "_rank": rank_and(x.get("_rank"), rr)}) for k, x in u]
                     areas.update(a)
                     units += u
                     d["_battle_refs"] += sub["_battle_refs"]
@@ -228,11 +268,20 @@ def resolve_mission(path, mis_root, depth=0):
     return areas, units, d
 
 
+def rank_and(a, b):
+    """The ranks two rankRanges both allow ([lo, hi], None = any)."""
+    if not a or not b:
+        return a or [int(b[0]), int(b[1])]
+    return [max(int(a[0]), int(b[0])), min(int(a[1]), int(b[1]))]
+
+
 def team_of(name):
     n = name.lower()
     return 1 if n.startswith("t1") or "_t1_" in n else 2 if n.startswith("t2") or "_t2_" in n else 0
 
 
+RANK_MAX = 99  # rankRange without an upper end (the game's go to 50)
+AIR_SPAWN = re.compile(r"t[12]_(air|bombers|heavy_bombers|heli)_spawn", re.I)
 MODE_SUFFIX = {"arcade": "arcade", "realistic": "realistic", "simulator": "hardcore"}
 
 
@@ -294,17 +343,28 @@ def mission_areas(path, mis_root):
         if k:
             for m in as_list((u.get("props") or {}).get("squad_members")):
                 add(m, k)
+    # 4. where aircraft and helicopters appear in the air (spheres; the suffix is the air mode, not the ground one)
+    for n in areas:
+        if AIR_SPAWN.match(n):
+            add(n, "airspawn")
     out = []
     for name, kind in picked.items():
         a = areas[name]
         rec = {"name": name, "kind": kind, "team": team_of(name), "type": a.get("type", "?"),
                "tm": [[round(x, 3) for x in row] for row in a["tm"]]}
-        mode = area_mode(name)
+        if a.get("_rank"):
+            rec["rank"] = a["_rank"]
+        mode = area_mode(name) if kind != "airspawn" else None
         if mode:
             rec["mode"], rec["group"] = mode, name[: name.lower().rindex("_" + MODE_SUFFIX[mode])]
         out.append(rec)
     mission = ms.get("mission") or {}
-    return str(mission.get("level", "")), str(mission.get("type", "")), out
+    # the mission's object groups (airfields, heli pads, props): placed composites, see group_placements
+    groups = [(str(u.get("unit_class", "")), u["tm"], u.get("_rank") or [0, RANK_MAX]) for kind, u in units if kind == "objectGroups" and isinstance(u.get("tm"), list)]
+    # anti-aircraft guns (airfield and heli pad defences): [name, unit class, x, z]; the game sets them on the ground
+    aa = [[str(u.get("name", "")), str(u.get("unit_class", "")), round(u["tm"][3][0], 1), round(u["tm"][3][2], 1)] + (u.get("_rank") or [0, RANK_MAX])
+          for kind, u in units if kind == "air_defence" and isinstance(u.get("tm"), list)]
+    return str(mission.get("level", "")), str(mission.get("type", "")), out, groups, aa
 
 
 def extract_missions(mis):
@@ -314,15 +374,185 @@ def extract_missions(mis):
         if f.name.startswith("template_"):
             continue  # imported building blocks; some still name another map's level
         try:
-            level, mtype, areas = mission_areas(f, mis)
+            level, mtype, areas, groups, aa = mission_areas(f, mis)
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             print(f"  skip mission {f.name}: {e}", file=sys.stderr)
             continue
         if not level.startswith("levels/") or not areas:
             continue
         lv = Path(level).stem
-        by_level.setdefault(lv, []).append({"name": f.name[: -len(".blk.json")], "type": mtype, "areas": areas})
+        by_level.setdefault(lv, []).append({"name": f.name[: -len(".blk.json")], "type": mtype, "areas": areas, "aa": aa, "_groups": groups})
     return by_level
+
+
+def load_object_groups(root):
+    """gamedata/objectgroups/*.blk as JSON, by lower-case name."""
+    return {f.name[: -len(".blk.json")].lower(): load_json(f) for f in (root / "gamedata" / "objectgroups").glob("*.blk.json")}
+
+
+def snap_aa(missions, ogs):
+    """Airfield AA guns stand in the airfield object group's air_def slots, not at the mission's spots (those are
+    30-700 m off any slot): each gun moves to the nearest free slot of an airfield in the same battles; the
+    airfield's slots left free stay as spare AA positions (class ""). Heli pad guns keep their spots (pads have no slots)."""
+    for m in missions:
+        slots = []  # [x, z, lo, hi, airfield]
+        for g, (cls, tm, rank) in enumerate(m["_groups"]):
+            for n in as_list((ogs.get(cls.lower()) or {}).get("node")):
+                if isinstance(n, dict) and n.get("name") == "#position" and n.get("type") == "air_def" and isinstance(n.get("tm"), list):
+                    p = compose(tm, n["tm"])[3]
+                    slots.append([round(p[0], 1), round(p[2], 1), int(rank[0]), int(rank[1]), g])
+        pairs = sorted((math.hypot(a[2] - sl[0], a[3] - sl[1]), i, j) for i, a in enumerate(m["aa"]) for j, sl in enumerate(slots)
+                       if "helipad" not in (a[0] + a[1]).lower() and a[4] <= sl[3] and sl[2] <= a[5])
+        gun, used = {}, {}
+        for d, i, j in pairs:
+            if d < 1500 and i not in gun and j not in used:
+                gun[i], used[j] = j, i
+        for i, j in gun.items():
+            m["aa"][i][2:4] = slots[j][:2]
+        fields = {slots[j][4] for j in used}
+        m["aa"] += [["", "", sl[0], sl[1], sl[2], sl[3]] for j, sl in enumerate(slots) if j not in used and sl[4] in fields]
+
+
+def compose(g, n):
+    """Dagor tm (rows: x, y, z axis, position) of n placed inside g."""
+    axes = [[sum(n[i][k] * g[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    return axes + [[g[3][j] + sum(n[3][k] * g[k][j] for k in range(3)) for j in range(3)]]
+
+
+def expand_group(cls, tm, ogs, depth=0):
+    """(kind, name, world tm) of every node of an object group, nested groups expanded: kind "model" (a RendInst
+    or DynModel), "slab" (the textured ground the game lays under airfields, heli pads and trenches: ^^ in the
+    node's flag prefix, or * on a runway's surface mesh) or "spawn" (name "heli" or "plane": a parking spot units spawn on, from the airfield block).
+    Node names carry flag prefixes (# $ % > * +); the exporter skips names that are no model (lights, boxes)."""
+    d = ogs.get(cls.lower())
+    if d is None or depth > 4:
+        return [("model", cls, tm)]
+    out, nodes = [], []
+    for n in as_list(d.get("node")):
+        raw = str(n.get("name", "")) if isinstance(n, dict) else ""
+        name = re.sub(r"^[^A-Za-z0-9_]+", "", raw)
+        if name and isinstance(n.get("tm"), list):
+            flags = raw[: len(raw) - len(name)]
+            # ^^: a decal slab; * with a surface name: the runway's own decal mesh (a RendInst; * ramps are objects)
+            surface = "^^" in flags or ("*" in flags and ("_mesh" in name or name.endswith("_decals")))
+            nodes.append((surface, name, compose(tm, n["tm"])))
+    has_slab = any(slab for slab, _, _ in nodes)
+    for af in as_list(d.get("airfield")):
+        if not isinstance(af, dict):
+            continue
+        spawn = af.get("spawn") or []
+        for p in (spawn if spawn and isinstance(spawn[0], list) else [spawn] if spawn else []):
+            out.append(("spawn", "heli" if "helipad" in cls.lower() else "plane", compose(tm, [[1, 0, 0], [0, 1, 0], [0, 0, 1], p])))
+        if has_slab:
+            continue
+        # no slab: the runway or pad surface as a scaled concrete unit square, from start, end and width
+        try:
+            (sx, sy, sz), (ex, ey, ez), w = af["start"], af["end"], float(af["width"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        dx, dz = ex - sx, ez - sz
+        ln = (dx * dx + dz * dz) ** 0.5 or 1.0
+        local = [[dx, 0, dz], [0, 1, 0], [-dz / ln * w, 0, dx / ln * w], [(sx + ex) / 2, (sy + ey) / 2 + RUNWAY_LIFT, (sz + ez) / 2]]
+        out.append(("model", "__runway__", compose(tm, local)))
+    for slab, name, wtm in nodes:
+        if slab:
+            out.append(("slab", name, wtm))
+        else:
+            out += expand_group(name, wtm, ogs, depth + 1) if name.lower() in ogs else [("model", name, wtm)]
+    return out
+
+
+def group_placements(missions, ogs):
+    """Placements file lines (tag = placement id), per mission the [id, lowest rank, highest rank] it places, the ground slabs
+    [(id, model, tm)], the spawn spots [[id, "heli" | "plane", x, y, z]] and per id the height of the group's
+    origin (the game sets groups on the ground; their own heights are often far off it): missions of one level
+    share most of their groups, so each distinct (group, tm) is exported once."""
+    ids, lines, per, slabs, spawns, origins = {}, [], {}, [], [], []
+    for m in missions:
+        for cls, tm, rank in m["_groups"]:
+            key = (cls.lower(), tuple(round(x, 2) for row in tm for x in row))
+            if key not in ids:
+                ids[key] = i = len(ids)
+                origins.append(round(tm[3][1], 2))
+                for kind, name, wtm in expand_group(cls, tm, ogs):
+                    if kind == "model":
+                        lines.append(f"{i} {name} " + " ".join(f"{x:.4f}" for row in wtm for x in row))
+                    elif kind == "slab":
+                        slabs.append((i, name, wtm))
+                    else:
+                        spawns.append([i, name] + [round(x, 2) for x in wtm[3]])
+            per.setdefault(m["name"], []).append([ids[key], int(rank[0]), int(rank[1])])
+    return lines, per, slabs, spawns, origins
+
+
+def extract_slabs(game, names, tmp, out_dir):
+    """data/slabs/<model>.js per ground slab model (shared by every level): its mesh and its textures as JPEG.
+    Returns the vertices (n x 3, model frame) per model that exported, for the tiles around its placements."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jobs = tmp / "slab_jobs.txt"
+    jobs.write_text("".join(f"slab {n} {tmp / ('slab_' + n)}\n" for n in sorted(names)))
+    r = subprocess.run([str(OBJECTS_EXE), str(game), str(jobs)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    print(r.stdout, end="")
+    verts = {}
+    for n in sorted(names):
+        src = tmp / f"slab_{n}.slab"
+        if not src.exists():
+            continue
+        raw = src.read_bytes()
+        parts, = struct.unpack_from("<I", raw)
+        o, pts, texs = 4, [], set()
+        for _ in range(parts):
+            t, _, nv = struct.unpack_from("<III", raw, o)
+            texs.add(t)
+            pts.append(np.frombuffer(raw, "<f4", nv * 5, o + 12).reshape(nv, 5)[:, :3])
+            o += 12 + nv * 20
+            ni, = struct.unpack_from("<I", raw, o)
+            o += 4 + ni * 4
+        tex, alpha = [], []
+        for k in range(len(texs)):
+            b = (tmp / f"slab_{n}.{k}.rgba").read_bytes()
+            w, h = struct.unpack_from("<II", b)
+            im = Image.frombytes("RGBA", (w, h), b[8:])
+            im.thumbnail((SLAB_PX, SLAB_PX), Image.LANCZOS)
+            # the alpha is the decal's mask: concrete and tracks opaque, the ground around them shows through
+            for ch, out in ((im.convert("RGB"), tex), (im.getchannel("A"), alpha)):
+                buf = io.BytesIO()
+                ch.save(buf, "JPEG", quality=85)
+                out.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii"))
+        blob = base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+        (out_dir / f"{n}.js").write_text(f'WTV_SLAB("{n}",' + json.dumps({"mesh": blob, "tex": tex, "alpha": alpha}, separators=(",", ":")) + ");\n", encoding="ascii")
+        verts[n] = np.concatenate(pts).astype(np.float64)
+    return verts
+
+
+def slab_tiles(exe, game, level, slabs, verts, tmp):
+    """Per ground slab placement: its model, tm and the landmesh around it every SLAB_TILE m (the whole level has
+    one height every FAR_CELL m, which misses the landmesh's finer triangles around airfields and heli pads)."""
+    png = tmp / f"{level}.tile.png"
+    run(exe, "level", Path(game) / "levels" / f"{level}.bin", "--terrain", "landmesh", "--cell", str(SLAB_TILE), "--heightmap", png)
+    meta = load_json(png.with_suffix(".json"))
+    Image.MAX_IMAGE_PIXELS = None  # our own export: a 130 km level is 16k x 16k at SLAB_TILE
+    with Image.open(png) as im:
+        h = np.asarray(im)  # 16-bit, converted per tile below (the whole level in float64 would take gigabytes)
+    out = []
+    for tag, name, tm in slabs:
+        if name not in verts:
+            continue
+        a = np.asarray(tm, dtype=np.float64)
+        wx, wz = verts[name] @ a[:3, 0] + a[3, 0], verts[name] @ a[:3, 2] + a[3, 2]  # the rows of tm are its axes
+        i0 = max(0, int((wx.min() - SLAB_MARGIN - meta["origin_x"]) // SLAB_TILE))
+        j0 = max(0, int((wz.min() - SLAB_MARGIN - meta["origin_z"]) // SLAB_TILE))
+        i1 = min(h.shape[1] - 1, int((wx.max() + SLAB_MARGIN - meta["origin_x"]) // SLAB_TILE) + 1)
+        j1 = min(h.shape[0] - 1, int((wz.max() + SLAB_MARGIN - meta["origin_z"]) // SLAB_TILE) + 1)
+        t = meta["height_min"] + (meta["height_max"] - meta["height_min"]) * h[j0:j1 + 1, i0:i1 + 1].astype(np.float64) / 65535
+        lo, hi = float(t.min()), float(t.max()) + 0.01
+        q = np.round((t - lo) / (hi - lo) * 65535).astype("<u2")
+        out.append({"tag": tag, "model": name, "tm": [round(x, 4) for row in tm for x in row],
+                    "tile": {"x0": meta["origin_x"] + i0 * SLAB_TILE, "z0": meta["origin_z"] + j0 * SLAB_TILE, "cell": SLAB_TILE,
+                             "w": int(t.shape[1]), "h": int(t.shape[0]), "lo": round(lo, 3), "hi": round(hi, 3),
+                             "q": base64.b64encode(zlib.compress(q.tobytes(), 6)).decode("ascii")}})
+    png.unlink(missing_ok=True)
+    return out
 
 
 # ---------------------------------------------------------------- maps
@@ -352,9 +582,12 @@ def water_level(text, hmin):
     return float(m.group(1)) if m and float(m.group(1)) > hmin else None
 
 
-def extract_map(exe, game, level, missions, tmp, out_dir):
-    png = tmp / f"{level}.png"
-    run(exe, "level", Path(game) / "levels" / f"{level}.bin", "--heightmap", png)
+def extract_map(exe, game, level, missions, tmp, out_dir, far=False):
+    """maps/<level>.js from the HM2 heightmap; far: maps/<level>.far.js from the whole landmesh instead."""
+    name = f"{level}.far" if far else level
+    png = tmp / f"{name}.png"
+    extra = ["--terrain", "landmesh", "--cell", str(FAR_CELL)] if far else []
+    run(exe, "level", Path(game) / "levels" / f"{level}.bin", *extra, "--heightmap", png)
     meta = load_json(png.with_suffix(".json"))
     with Image.open(png) as im:
         h = np.asarray(im).astype(np.uint16)
@@ -369,15 +602,15 @@ def extract_map(exe, game, level, missions, tmp, out_dir):
     blob = base64.b64encode(zlib.compress(h.astype("<u2").tobytes(), 6)).decode("ascii")
     settings = level_settings(exe, game, level)
     info = {
-        "name": level, "bounds": map_bounds(settings), "width": int(h.shape[1]), "height": int(h.shape[0]), "cell": cell,
+        "name": name, "bounds": map_bounds(settings), "width": int(h.shape[1]), "height": int(h.shape[0]), "cell": cell,
         "ox": float(meta["origin_x"]), "oz": float(meta["origin_z"]),
         "hmin": float(meta["height_min"]), "hmax": float(meta["height_max"]),
         "source": meta.get("source", "?"), "missions": missions,
         "water": water_level(settings, float(meta["height_min"])),
     }
     js = "WTV_MAP(" + json.dumps(info, separators=(",", ":"))[:-1] + ',"h":"' + blob + '"});\n'
-    (out_dir / f"{level}.js").write_text(js, encoding="ascii")
-    return {k: info[k] for k in ("name", "width", "height", "cell", "ox", "oz", "source")} | {"missions": len(missions)}
+    (out_dir / f"{name}.js").write_text(js, encoding="ascii")
+    return {k: info[k] for k in ("name", "width", "height", "cell", "ox", "oz", "source")} | {"missions": len(missions), "level": level}
 
 
 def keep_objects(maps, out_dir):
@@ -399,18 +632,20 @@ def extract_objects(game, maps, tmp, out_dir):
     print("exporting objects, trees and ground colours ...")
     jobs = tmp / "objects_jobs.txt"
     # shortcut: the exporter splits job lines on whitespace, so tmp must not contain spaces (tempfile's dir has none)
-    jobs.write_text("".join(f"{m['name']} {tmp / m['name']} {m['ox']} {m['oz']} {m['cell']} {m['width']} {m['height']}\n" for m in maps))
+    base = {m["name"]: tmp / m["name"].replace(".", "_") for m in maps}  # the exporter replaces the extension
+    jobs.write_text("".join(f"{m['level']} {base[m['name']]} {m['ox']} {m['oz']} {m['cell']} {m['width']} {m['height']}{' ' + str(m['placements']) if 'placements' in m else ''}\n" for m in maps))
     r = subprocess.run([str(OBJECTS_EXE), str(game), str(jobs)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     print(r.stdout, end="")
     if r.returncode:
         print(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "wtv-objects failed", file=sys.stderr)
     for m in maps:
-        src = tmp / (m["name"] + ".obj")
+        src = base[m["name"]].with_suffix(".obj")
         if src.exists():
             blob = base64.b64encode(zlib.compress(src.read_bytes(), 6)).decode("ascii")
-            (out_dir / f"{m['name']}.obj.js").write_text(f'WTV_OBJ("{m["name"]}","{blob}");\n', encoding="ascii")
+            extra = "," + json.dumps({k: m[k] for k in ("missions", "slabs", "spawns", "origins")}, separators=(",", ":")) if "placements" in m else ""
+            (out_dir / f"{m['name']}.obj.js").write_text(f'WTV_OBJ("{m["name"]}","{blob}"{extra});\n', encoding="ascii")
             m["objects"] = True
-        ground = tmp / (m["name"] + ".ground")
+        ground = base[m["name"]].with_suffix(".ground")
         if ground.exists():
             raw = ground.read_bytes()
             w, h = struct.unpack("<II", raw[:8])
@@ -450,6 +685,7 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "data"))
     ap.add_argument("--keep-tmp", action="store_true")
     ap.add_argument("--skip-objects", action="store_true", help="keep the objects/trees/ground files of an earlier run")
+    ap.add_argument("--far", action="store_true", help="also export each whole level from its landmesh (Max build)")
     a = ap.parse_args()
 
     exe = find_wt_unpack(a.wt_unpack)
@@ -463,13 +699,21 @@ def main():
         run(exe, "extract", game / "aces.vromfs.bin", "-o", tmp / "aces", "--blk", "json", "--filter", "groundmodels_weapons")
         run(exe, "extract", game / "mis.vromfs.bin", "-o", tmp / "mis", "--blk", "json", "--filter", "gamedata/missions")
         run(exe, "extract", game / "lang.vromfs.bin", "-o", tmp / "lang", "--filter", "lang/units")
+        run(exe, "extract", game / "char.vromfs.bin", "-o", tmp / "char", "--blk", "json", "--filter", "config/modifications")
+        if a.far:
+            run(exe, "extract", game / "aces.vromfs.bin", "-o", tmp / "og", "--blk", "json", "--filter", "gamedata/objectgroups")
 
         names = load_lang(tmp / "lang")
-        tanks = extract_tanks(tmp / "aces", names)
+        tanks = extract_tanks(tmp / "aces", names, stock_spread(tmp / "char"))
         print(f"tanks: {len(tanks)}")
         by_level = extract_missions(tmp / "mis")
+        if a.far:
+            ogs = load_object_groups(tmp / "og")
+            for ms in by_level.values():
+                snap_aa(ms, ogs)
         # "water" is the empty ocean level that many tank test/event missions point at, not a battlefield
         levels = a.levels.split(",") if a.levels else sorted(set(by_level) - {"water"})
+        groups_of = {lv: [{"name": m["name"], "_groups": m.pop("_groups")} for m in ms] for lv, ms in by_level.items()}
         maps = []
         for i, lv in enumerate(levels, 1):
             try:
@@ -478,10 +722,38 @@ def main():
                 print(f"[{i}/{len(levels)}] {lv}: {m['width']}x{m['height']} @ {m['cell']} m ({m['source']}), {m['missions']} missions")
             except (RuntimeError, OSError, AssertionError, KeyError) as e:
                 print(f"[{i}/{len(levels)}] {lv}: FAILED {str(e).splitlines()[0]}", file=sys.stderr)
+        fars = []
+        groups = []
+        if a.far:
+            placed = {m["level"]: group_placements(groups_of.get(m["level"], []), ogs) for m in maps}
+            verts = extract_slabs(game, {n for _, _, sl, _, _ in placed.values() for _, n, _ in sl}, tmp, out / "slabs")
+            for m in maps:
+                lines, per, slabs, spawns, origins = placed[m["level"]]
+                if lines:
+                    pf = tmp / f"{m['level']}_placements.txt"
+                    pf.write_text("\n".join(lines) + "\n")
+                    groups.append({"name": f"{m['level']}.groups", "level": m["level"], "ox": 0, "oz": 0, "cell": 1, "width": 0, "height": 0,
+                                   "placements": pf, "missions": per, "spawns": spawns, "origins": origins,
+                                   "slabs": slab_tiles(exe, game, m["level"], slabs, verts, tmp) if slabs else []})
+            for i, m in enumerate(maps, 1):
+                try:
+                    f = extract_map(exe, game, m["level"], [], tmp, out / "maps", far=True)
+                    fars.append(f)
+                    print(f"[{i}/{len(maps)}] {f['name']}: {f['width']}x{f['height']} @ {f['cell']} m ({f['source']})")
+                except (RuntimeError, OSError, AssertionError, KeyError) as e:
+                    print(f"[{i}/{len(maps)}] {m['level']}.far: FAILED {str(e).splitlines()[0]}", file=sys.stderr)
         if a.skip_objects:
-            keep_objects(maps, out / "maps")
+            keep_objects(maps + fars, out / "maps")
+            extract_objects(game, groups, tmp, out / "maps")  # cheap, and its format follows the slabs and spawns
         else:
-            extract_objects(game, maps, tmp, out / "maps")
+            extract_objects(game, maps + fars + groups, tmp, out / "maps")
+        by_name = {m["name"]: m for m in maps}
+        for f in fars:
+            if f["name"].endswith(".far"):
+                by_name[f["level"]]["far"] = {k: v for k, v in f.items() if k != "level"}  # the app finds the whole-level files here
+        for f in groups:
+            if f.get("objects") and "far" in by_name[f["level"]]:
+                by_name[f["level"]]["far"]["groups"] = True
         index = {"maps": maps, "tanks": tanks}
         (out / "index.js").write_text("WTV_INDEX(" + json.dumps(index, separators=(",", ":")) + ");\n", encoding="utf-8")
         print(f"wrote {out / 'index.js'} ({len(maps)} maps)")

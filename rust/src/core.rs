@@ -231,6 +231,19 @@ pub struct Terrain {
     pub lo: f64,
     pub hi: f64,
     src: Option<Vec<u8>>,
+    /// What lies outside this grid (Max build: the ground patches of airfields and heli pads, then the whole level)
+    pub outer: Option<std::sync::Arc<Outer>>,
+}
+
+/// The surface around a tank map: the first patch that holds a point, else the whole level.
+pub struct Outer {
+    pub patches: Vec<std::sync::Arc<Terrain>>,
+    pub far: std::sync::Arc<Terrain>,
+}
+impl Outer {
+    fn at(&self, x: f64, z: f64) -> &Terrain {
+        self.patches.iter().map(|p| &**p).find(|p| p.inside(x, z)).unwrap_or(&*self.far)
+    }
 }
 
 impl Terrain {
@@ -254,16 +267,43 @@ impl Terrain {
             }
             src
         });
-        let (lo, hi) = hv.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
-        Self { h: hv, w, hh: h, cell, ox: meta.ox, oz: meta.oz, x1: meta.ox + (w - 1) as f64 * cell, z1: meta.oz + (h - 1) as f64 * cell, lo: lo as f64, hi: hi as f64, src }
+        Self::grid(hv, w, h, cell, meta.ox, meta.oz, src)
+    }
+    /// Heights `h` (row j = z index j) on a grid of `w` x `hh` points `cell` m apart from (ox, oz).
+    pub fn grid(h: Vec<f32>, w: usize, hh: usize, cell: f64, ox: f64, oz: f64, src: Option<Vec<u8>>) -> Self {
+        let (lo, hi) = h.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+        Self { h, w, hh, cell, ox, oz, x1: ox + (w - 1) as f64 * cell, z1: oz + (hh - 1) as f64 * cell, lo: lo as f64, hi: hi as f64, src, outer: None }
+    }
+    /// x0, z0, x1, z1, lowest and highest point, with what lies outside.
+    pub fn extent(&self) -> [f64; 6] {
+        match &self.outer {
+            Some(o) => {
+                let f = o.far.extent();
+                [f[0].min(self.ox), f[1].min(self.oz), f[2].max(self.x1), f[3].max(self.z1), o.patches.iter().fold(f[4].min(self.lo), |a, p| a.min(p.lo)), o.patches.iter().fold(f[5].max(self.hi), |a, p| a.max(p.hi))]
+            }
+            None => [self.ox, self.oz, self.x1, self.z1, self.lo, self.hi],
+        }
+    }
+    /// Inside this grid, or anywhere around it when there is an outer surface.
+    pub fn reaches(&self, x: f64, z: f64) -> bool {
+        match &self.outer {
+            Some(o) => self.inside(x, z) || o.far.inside(x, z),
+            None => self.inside(x, z),
+        }
     }
     pub fn src_at(&self, x: f64, z: f64) -> u8 {
+        if let (Some(o), false) = (&self.outer, self.inside(x, z)) {
+            return o.at(x, z).src_at(x, z);
+        }
         let Some(src) = &self.src else { return 0 };
         let i = (((x - self.ox) / self.cell).round().max(0.0) as usize).min(self.w - 1);
         let j = (((z - self.oz) / self.cell).round().max(0.0) as usize).min(self.hh - 1);
         src[j * self.w + i]
     }
     pub fn height_at(&self, x: f64, z: f64) -> f64 {
+        if let (Some(o), false) = (&self.outer, self.inside(x, z)) {
+            return o.at(x, z).height_at(x, z);
+        }
         let (w, h) = (self.w as f64, self.hh as f64);
         let px = ((x - self.ox) / self.cell).clamp(0.0, w - 1.000001);
         let pz = ((z - self.oz) / self.cell).clamp(0.0, h - 1.000001);
@@ -320,7 +360,7 @@ pub fn sweep_reach(t: &Terrain, tab: &Table, a_pt: Pt, p: &SweepP, a0: usize, a1
         let (mut n_max, mut top) = (n, f32::NEG_INFINITY);
         for (i, pr) in prof.iter_mut().enumerate() {
             let (x, z) = (a_pt.x + dx * i as f64 * tab.ds, a_pt.z + dz * i as f64 * tab.ds);
-            if !t.inside(x, z) {
+            if !t.reaches(x, z) {
                 n_max = i;
                 break;
             }
@@ -395,7 +435,7 @@ pub fn sweep_hit(t: &Terrain, tab: &Table, b_pt: Pt, p: &SweepP, a0: usize, a1: 
         let mut n_max = n;
         for (i, gi) in g.iter_mut().enumerate() {
             let (x, z) = (b_pt.x + dx * i as f64 * tab.ds, b_pt.z + dz * i as f64 * tab.ds);
-            if !t.inside(x, z) {
+            if !t.reaches(x, z) {
                 n_max = i;
                 break;
             }
@@ -434,7 +474,7 @@ pub fn sweep_view(t: &Terrain, pt: Pt, p: &SweepP, a0: usize, a1: usize) -> Vec<
         for i in 1..n {
             let d = i as f64 * p.ds;
             let (x, z) = (pt.x + dx * d, pt.z + dz * d);
-            if !t.inside(x, z) {
+            if !t.reaches(x, z) {
                 break;
             }
             let s = t.height_at(x, z);
@@ -454,6 +494,32 @@ pub fn sweep_view(t: &Terrain, pt: Pt, p: &SweepP, a0: usize, a1: usize) -> Vec<
         }
     }
     out
+}
+
+/// Where a shot lands that leaves the bore `dh` (sideways) and `dv` (up) radians off the line at elevation `e`
+/// (radians) along `dir` from `a` at height y0: the first point its path meets the surface `t` beyond the
+/// muzzle, searched every `step` m and refined to 1 cm, within max_s m.
+#[allow(clippy::too_many_arguments)]
+pub fn impact(t: &Terrain, sh: &Shell, a: Pt, y0: f64, dir: (f64, f64), e: f64, dh: f64, dv: f64, max_s: f64, step: f64) -> Option<[f64; 3]> {
+    let tr = simulate(sh, e + dv, y0, max_s, SimOpt { y_floor: Some(t.extent()[4] - 10.0), ..Default::default() });
+    let (c, s) = (dh.cos(), dh.sin());
+    let d = (dir.0 * c + dir.1 * s, dir.1 * c - dir.0 * s);
+    let end = *tr.s.last()?;
+    let below = |x: f64| tr.at(Key::Y, x) <= t.height_at(a.x + d.0 * x, a.z + d.1 * x);
+    let mut x = step;
+    while x <= end {
+        if below(x) {
+            let (mut lo, mut hi) = (x - step, x);
+            while hi - lo > 0.01 {
+                let m = (lo + hi) / 2.0;
+                if below(m) { hi = m } else { lo = m }
+            }
+            let (px, pz) = (a.x + d.0 * hi, a.z + d.1 * hi);
+            return Some([px, t.height_at(px, pz), pz]);
+        }
+        x += step;
+    }
+    None
 }
 
 /// Straight segment vs terrain: distance of the first blocking point.
@@ -628,5 +694,38 @@ mod tests {
         assert_eq!(out[37] & 1, 1);
         assert_eq!(out[200] & 1, 0);
         assert_eq!(out[200] & 2, 2);
+    }
+
+    #[test]
+    fn impact_lands_on_the_ground_and_spreads_with_the_angles() {
+        let t = flat(4000.0, 4.0, |_, _| 0.0);
+        let sh = l44();
+        let e = solve_exact(&sh, 1000.0, -2.0, 2.0, -10.0, 20.0)[0]; // from 2 m up to the ground at 1000 m
+        let hit = |dh: f64, dv: f64| impact(&t, &sh, P(100.0, 100.0), 2.0, (0.0, 1.0), e, dh, dv, 3000.0, 2.0).unwrap();
+        let c = hit(0.0, 0.0);
+        assert!((c[0] - 100.0).abs() < 1e-6 && (c[2] - 1100.0).abs() < 2.0, "{c:?}"); // aimed at the ground at 1000 m
+        let side = hit(0.001, 0.0); // 1 mrad sideways: about 1 m at 1 km
+        assert!((side[0] - 101.0).abs() < 0.05 && (side[2] - c[2]).abs() < 0.1, "{side:?}");
+        let up = hit(0.0, 0.001); // 1 mrad up on a flat 0.1° descent lands far beyond
+        assert!(up[2] > c[2] + 50.0 && (up[0] - 100.0).abs() < 1e-6, "{up:?}");
+    }
+
+    #[test]
+    fn outer_surfaces_answer_outside_the_grid() {
+        let tank = flat(100.0, 2.0, |_, _| 5.0); // 0..100
+        let far = Terrain::grid(vec![1.0; 16], 4, 4, 100.0, -100.0, -100.0, None); // -100..200
+        let patch = std::sync::Arc::new(Terrain::grid(vec![9.0; 9], 3, 3, 10.0, 120.0, 120.0, None)); // 120..140
+        let mut t = tank.clone();
+        t.outer = Some(std::sync::Arc::new(Outer { patches: vec![patch], far: std::sync::Arc::new(far) }));
+        assert!((t.height_at(50.0, 50.0) - 5.0).abs() < 0.01);
+        assert!((t.height_at(130.0, 130.0) - 9.0).abs() < 1e-6);
+        assert!((t.height_at(-50.0, 150.0) - 1.0).abs() < 1e-6);
+        assert!(t.reaches(-50.0, 150.0) && !t.reaches(500.0, 0.0) && !tank.reaches(-50.0, 150.0));
+        let e = t.extent();
+        assert_eq!(e[..4], [-100.0, -100.0, 200.0, 200.0]);
+        assert!((e[4] - 1.0).abs() < 1e-6 && (e[5] - 9.0).abs() < 1e-6);
+        // a sight line from the map onto the patch crosses all three surfaces; one too low hits the patch
+        assert_eq!(los_blocked(&t, P(50.0, 50.0), 6.0, P(130.0, 130.0), 10.0, 1.0), None);
+        assert!(los_blocked(&t, P(50.0, 50.0), 6.0, P(135.0, 135.0), 8.0, 1.0).is_some_and(|s| s > 95.0));
     }
 }

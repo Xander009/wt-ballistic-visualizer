@@ -482,8 +482,6 @@ dependencies = [
 [[package]]
 name = "wt-formats"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cc92320ebb10137ea72419d36b91febc1aa597af3ee762d75282d3980575d89"
 dependencies = [
  "bcn-decode",
  "flate2",
